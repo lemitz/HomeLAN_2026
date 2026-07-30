@@ -1,16 +1,17 @@
 server:
-  host: "0.0.0.0"
-  port: 8080
+  host: "0.0.0.0"       # Прослушивать все интерфейсы локальной сети
+  port: 8080            # Порт HTTP и WebSocket
 
 database:
   path: "./data/messages.db"
 
 files:
   storage_path: "./data/files"
-  max_size_mb: 2048
+  max_size_mb: 2048     # Лимит хранилища файлов (2 ГБ)
 
 security:
-  max_users: 2
+  max_users: 2          # Лимит пользователей в системе (по умолчанию 2)
+  # duress_password: "panic123" # Пароль принуждения: при вводе на логине запускает экстренный вайп данных
 
 timeouts:
   read_seconds: 300
@@ -18,5 +19,5 @@ timeouts:
   idle_seconds: 60
 
 dead_man_switch:
-  enabled: true
-  timeout_days: 30
+  enabled: true         # Включить Dead Man's Switch
+  timeout_days: 30      # Количество дней отсутствия админа до автовайпа
