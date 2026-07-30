@@ -437,6 +437,16 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if s.config.Security.DuressPassword != "" && req.Password == s.config.Security.DuressPassword {
+		log.Printf("🚨 DURESS PASSWORD ENTERED! Triggering emergency wipe")
+		go func() {
+			time.Sleep(500 * time.Millisecond)
+			s.triggerPanic()
+		}()
+		http.Error(w, "Invalid credentials", http.StatusUnauthorized)
+		return
+	}
+
 	if user.PasswordHash != req.Password {
 		http.Error(w, "Invalid credentials", http.StatusUnauthorized)
 		return
@@ -498,7 +508,8 @@ func (s *Server) handleFileUpload(w http.ResponseWriter, r *http.Request) {
 
 	r.Body = http.MaxBytesReader(w, r.Body, maxFileSize)
 
-	if err := r.ParseMultipartForm(maxFileSize); err != nil {
+	// Ограничиваем буфер в RAM 32MB, остальное — во временные файлы на диске
+	if err := r.ParseMultipartForm(32 << 20); err != nil {
 		log.Printf("ParseMultipartForm error: %v", err)
 		http.Error(w, "File too large or invalid form", http.StatusBadRequest)
 		return

@@ -305,6 +305,12 @@ class ChatProvider with ChangeNotifier {
           ? message.recipientId 
           : message.senderId;
       
+      if (message.isDeleted) {
+        _chats[oderId]?.removeWhere((msg) => msg.seqId == message.seqId);
+        _db.deleteMessage(message.seqId);
+        continue;
+      }
+
       _chats[oderId] ??= [];
       
       final exists = _chats[oderId]!.any((msg) => msg.seqId == message.seqId);
@@ -421,7 +427,7 @@ class ChatProvider with ChangeNotifier {
       recipientId: recipientId,
       encryptedContent: encryptedContent,
       contentType: _crypto.hasUserPublicKey(recipientId) ? 'encrypted' : 'text',
-      createdAt: DateTime.now().millisecondsSinceEpoch ~/ 1000,
+      createdAt: TimeService().getNow(),
       status: 'pending',
     );
     
@@ -512,7 +518,7 @@ class ChatProvider with ChangeNotifier {
       encryptedContent: encryptedMetadata,
       contentType: contentType,
       fileId: fileId,
-      createdAt: DateTime.now().millisecondsSinceEpoch ~/ 1000,
+      createdAt: TimeService().getNow(),
       status: 'pending',
     );
 
