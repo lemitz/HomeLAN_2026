@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -18,10 +19,12 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"golang.org/x/crypto/bcrypt"
 	"homelan-server/internal/config"
 	"homelan-server/internal/db"
 	"homelan-server/internal/linking"
 	"homelan-server/internal/mdns"
+	"homelan-server/internal/models"
 	"homelan-server/internal/panic"
 	"homelan-server/internal/usb"
 	"homelan-server/internal/utils"
@@ -105,6 +108,7 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/api/files/upload", s.handleFileUpload)
 	mux.HandleFunc("/api/files/", s.handleFiles)
 	mux.HandleFunc("/api/panic", s.handlePanic)
+	mux.HandleFunc("/api/logout", s.handleLogout)
 
 	// Device Linking
 	mux.HandleFunc("/api/devices/link/create", s.handleLinkCreate)
@@ -205,6 +209,23 @@ func (s *Server) handlePanic(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	session, err := s.authenticate(r)
+	if err != nil {
+		http.Error(w, "Unauthorized: "+err.Error(), http.StatusUnauthorized)
+		return
+	}
+
+	user, err := s.db.GetUserByID(session.UserID)
+	if err != nil || user == nil {
+		http.Error(w, "User not found", http.StatusUnauthorized)
+		return
+	}
+
+	if !user.IsAdmin {
+		http.Error(w, "Forbidden: Admin access required", http.StatusForbidden)
+		return
+	}
+
 	var req struct {
 		Confirm string `json:"confirm"`
 	}
@@ -218,6 +239,8 @@ func (s *Server) handlePanic(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Invalid confirmation", http.StatusBadRequest)
 		return
 	}
+
+	log.Printf("🚨 PANIC INITIATED via API by admin user: %s (ID: %d)", user.Username, user.ID)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
@@ -236,11 +259,30 @@ func (s *Server) handleGetUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	session, err := s.authenticate(r)
+	if err != nil {
+		http.Error(w, "Unauthorized: "+err.Error(), http.StatusUnauthorized)
+		return
+	}
+
 	userIDStr := filepath.Base(r.URL.Path)
 	userID, err := strconv.ParseInt(userIDStr, 10, 64)
 	if err != nil {
 		http.Error(w, "Invalid user ID", http.StatusBadRequest)
 		return
+	}
+
+	// Only allow own details or partner's details (since it's a 2-user system)
+	if userID != session.UserID {
+		partner, err := s.db.GetPartner(session.UserID)
+		if err != nil {
+			http.Error(w, "Internal error", http.StatusInternalServerError)
+			return
+		}
+		if partner == nil || partner.ID != userID {
+			http.Error(w, "Forbidden", http.StatusForbidden)
+			return
+		}
 	}
 
 	user, err := s.db.GetUserByID(userID)
@@ -268,19 +310,13 @@ func (s *Server) handleGetPartner(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	userIDStr := r.URL.Query().Get("user_id")
-	if userIDStr == "" {
-		http.Error(w, "Missing user_id", http.StatusBadRequest)
-		return
-	}
-
-	userID, err := strconv.ParseInt(userIDStr, 10, 64)
+	session, err := s.authenticate(r)
 	if err != nil {
-		http.Error(w, "Invalid user_id", http.StatusBadRequest)
+		http.Error(w, "Unauthorized: "+err.Error(), http.StatusUnauthorized)
 		return
 	}
 
-	partner, err := s.db.GetPartner(userID)
+	partner, err := s.db.GetPartner(session.UserID)
 	if err != nil {
 		http.Error(w, "Internal error", http.StatusInternalServerError)
 		return
@@ -300,16 +336,19 @@ func (s *Server) handleGetPartner(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
-	userID := r.URL.Query().Get("user_id")
-	deviceID := r.URL.Query().Get("device_id")
-	token := r.URL.Query().Get("token")
-
-	if userID == "" || deviceID == "" || token == "" {
-		http.Error(w, "Missing parameters", http.StatusBadRequest)
+	session, err := s.authenticate(r)
+	if err != nil {
+		http.Error(w, "Unauthorized: "+err.Error(), http.StatusUnauthorized)
 		return
 	}
 
-	device, err := s.db.GetDeviceByID(deviceID)
+	deviceID := r.URL.Query().Get("device_id")
+	if deviceID != "" && deviceID != session.DeviceID {
+		http.Error(w, "Forbidden: device ID mismatch", http.StatusForbidden)
+		return
+	}
+
+	device, err := s.db.GetDeviceByID(session.DeviceID)
 	if err != nil || device == nil {
 		http.Error(w, "Device not found", http.StatusUnauthorized)
 		return
@@ -325,9 +364,9 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	client := s.hub.RegisterClient(conn, device.UserID, deviceID)
-	s.db.UpdateDeviceLastSeen(deviceID)
-	s.db.UpdateUserLastSeen(device.UserID)
+	client := s.hub.RegisterClient(conn, session.UserID, session.DeviceID)
+	s.db.UpdateDeviceLastSeen(session.DeviceID)
+	s.db.UpdateUserLastSeen(session.UserID)
 
 	go client.WritePump()
 	go client.ReadPump()
@@ -397,12 +436,20 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	token, tokenHash := generateSessionToken()
+	_, err = s.db.CreateSession(user.ID, device.DeviceID, tokenHash, 30*24*time.Hour)
+	if err != nil {
+		http.Error(w, "Failed to create session", http.StatusInternalServerError)
+		return
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"success":     true,
 		"user_id":     user.ID,
 		"device_id":   device.DeviceID,
 		"is_admin":    isAdmin,
+		"token":       token,
 		"server_time": time.Now().Unix(),
 	})
 
@@ -447,7 +494,28 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if user.PasswordHash != req.Password {
+	isCorrect := false
+	err = bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(req.Password))
+	if err == nil {
+		isCorrect = true
+	} else {
+		// Try fallback to plaintext for migration
+		if user.PasswordHash == req.Password {
+			isCorrect = true
+			// Migrate to bcrypt hash
+			hashedBytes, hashErr := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
+			if hashErr == nil {
+				if updateErr := s.db.UpdateUserPassword(user.ID, string(hashedBytes)); updateErr == nil {
+					log.Printf("ℹ️ Migrated password for user %s to secure hash", user.Username)
+					user.PasswordHash = string(hashedBytes)
+				} else {
+					log.Printf("⚠️ Failed to update migrated password: %v", updateErr)
+				}
+			}
+		}
+	}
+
+	if !isCorrect {
 		http.Error(w, "Invalid credentials", http.StatusUnauthorized)
 		return
 	}
@@ -457,13 +525,22 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Internal error", http.StatusInternalServerError)
 		return
 	}
-	if device == nil {
-		http.Error(w, "Device not registered", http.StatusUnauthorized)
-		return
-	}
-	if device.IsRevoked {
-		http.Error(w, "Device revoked", http.StatusForbidden)
-		return
+	if device != nil {
+		if device.UserID != user.ID {
+			http.Error(w, "Device registered under another user", http.StatusForbidden)
+			return
+		}
+		if device.IsRevoked {
+			http.Error(w, "Device revoked", http.StatusForbidden)
+			return
+		}
+	} else {
+		// Create device for this user
+		device, err = s.db.CreateDevice(user.ID, req.DeviceID, "Legacy/Unknown", "unknown", req.PublicKey)
+		if err != nil {
+			http.Error(w, "Failed to register device", http.StatusInternalServerError)
+			return
+		}
 	}
 
 	if len(req.PublicKey) > 0 {
@@ -476,19 +553,30 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	partner, _ := s.db.GetPartner(user.ID)
 	var partnerID int64 = 0
 	var partnerUsername string = ""
+	var partnerPublicKey []byte = nil
 	if partner != nil {
 		partnerID = partner.ID
 		partnerUsername = partner.Username
+		partnerPublicKey = partner.PublicKey
+	}
+
+	token, tokenHash := generateSessionToken()
+	_, err = s.db.CreateSession(user.ID, device.DeviceID, tokenHash, 30*24*time.Hour)
+	if err != nil {
+		http.Error(w, "Failed to create session", http.StatusInternalServerError)
+		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"success":          true,
-		"user_id":          user.ID,
-		"is_admin":         user.IsAdmin,
-		"partner_id":       partnerID,
-		"partner_username": partnerUsername,
-		"server_time":      time.Now().Unix(),
+		"success":            true,
+		"user_id":            user.ID,
+		"is_admin":           user.IsAdmin,
+		"token":              token,
+		"partner_id":         partnerID,
+		"partner_username":   partnerUsername,
+		"partner_public_key": partnerPublicKey,
+		"server_time":        time.Now().Unix(),
 	})
 
 	log.Printf("✅ User logged in: %s", req.Username)
@@ -500,9 +588,103 @@ func generateFileID() string {
 	return hex.EncodeToString(bytes)
 }
 
+func hashToken(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:])
+}
+
+func generateSessionToken() (string, string) {
+	bytes := make([]byte, 32)
+	if _, err := rand.Read(bytes); err != nil {
+		log.Fatalf("failed to read secure random: %v", err)
+	}
+	token := hex.EncodeToString(bytes)
+	return token, hashToken(token)
+}
+
+func (s *Server) authenticate(r *http.Request) (*models.Session, error) {
+	token := ""
+
+	// 1. Try X-Session-Token header
+	if h := r.Header.Get("X-Session-Token"); h != "" {
+		token = h
+	}
+
+	// 2. Try Authorization Bearer header
+	if token == "" {
+		if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
+			token = strings.TrimPrefix(auth, "Bearer ")
+		}
+	}
+
+	// 3. Try Sec-WebSocket-Protocol header
+	if token == "" {
+		if sub := r.Header.Get("Sec-WebSocket-Protocol"); sub != "" {
+			token = sub
+		}
+	}
+
+	// 4. Try Query parameter
+	if token == "" {
+		token = r.URL.Query().Get("token")
+	}
+
+	if token == "" {
+		return nil, errors.New("missing authentication token")
+	}
+
+	tokenHash := hashToken(token)
+	session, err := s.db.GetSessionByTokenHash(tokenHash)
+	if err != nil {
+		return nil, fmt.Errorf("session lookup error: %w", err)
+	}
+	if session == nil {
+		return nil, errors.New("invalid token")
+	}
+
+	if session.IsRevoked {
+		return nil, errors.New("session revoked")
+	}
+
+	if time.Now().Unix() > session.ExpiresAt {
+		return nil, errors.New("session expired")
+	}
+
+	return session, nil
+}
+
+func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	session, err := s.authenticate(r)
+	if err != nil {
+		http.Error(w, "Unauthorized: "+err.Error(), http.StatusUnauthorized)
+		return
+	}
+
+	if err := s.db.RevokeSession(session.TokenHash); err != nil {
+		http.Error(w, "Internal error", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+	})
+}
+
 func (s *Server) handleFileUpload(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	session, err := s.authenticate(r)
+	if err != nil {
+		http.Error(w, "Unauthorized: "+err.Error(), http.StatusUnauthorized)
 		return
 	}
 
@@ -515,17 +697,7 @@ func (s *Server) handleFileUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	userIDStr := r.FormValue("user_id")
-	if userIDStr == "" {
-		http.Error(w, "Missing user_id", http.StatusBadRequest)
-		return
-	}
-	userID, err := strconv.ParseInt(userIDStr, 10, 64)
-	if err != nil {
-		http.Error(w, "Invalid user_id", http.StatusBadRequest)
-		return
-	}
-
+	userID := session.UserID
 	user, err := s.db.GetUserByID(userID)
 	if err != nil || user == nil {
 		http.Error(w, "User not found", http.StatusUnauthorized)
@@ -618,6 +790,12 @@ func (s *Server) handleFileInfo(w http.ResponseWriter, r *http.Request, fileID s
 		return
 	}
 
+	session, err := s.authenticate(r)
+	if err != nil {
+		http.Error(w, "Unauthorized: "+err.Error(), http.StatusUnauthorized)
+		return
+	}
+
 	file, err := s.db.GetFileByID(fileID)
 	if err != nil || file == nil {
 		http.Error(w, "File not found", http.StatusNotFound)
@@ -627,6 +805,19 @@ func (s *Server) handleFileInfo(w http.ResponseWriter, r *http.Request, fileID s
 	if file.IsDeleted {
 		http.Error(w, "File deleted", http.StatusGone)
 		return
+	}
+
+	// Permission check: uploader or partner
+	if file.UploaderID != session.UserID {
+		partner, err := s.db.GetPartner(file.UploaderID)
+		if err != nil {
+			http.Error(w, "Internal error", http.StatusInternalServerError)
+			return
+		}
+		if partner == nil || partner.ID != session.UserID {
+			http.Error(w, "Forbidden", http.StatusForbidden)
+			return
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -645,6 +836,12 @@ func (s *Server) handleFileDownload(w http.ResponseWriter, r *http.Request, file
 		return
 	}
 
+	session, err := s.authenticate(r)
+	if err != nil {
+		http.Error(w, "Unauthorized: "+err.Error(), http.StatusUnauthorized)
+		return
+	}
+
 	file, err := s.db.GetFileByID(fileID)
 	if err != nil || file == nil {
 		http.Error(w, "File not found", http.StatusNotFound)
@@ -654,6 +851,19 @@ func (s *Server) handleFileDownload(w http.ResponseWriter, r *http.Request, file
 	if file.IsDeleted {
 		http.Error(w, "File deleted", http.StatusGone)
 		return
+	}
+
+	// Permission check: uploader or partner
+	if file.UploaderID != session.UserID {
+		partner, err := s.db.GetPartner(file.UploaderID)
+		if err != nil {
+			http.Error(w, "Internal error", http.StatusInternalServerError)
+			return
+		}
+		if partner == nil || partner.ID != session.UserID {
+			http.Error(w, "Forbidden", http.StatusForbidden)
+			return
+		}
 	}
 
 	f, err := os.Open(file.StoragePath)
@@ -709,6 +919,12 @@ func (s *Server) handleLinkCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	session, err := s.authenticate(r)
+	if err != nil {
+		http.Error(w, "Unauthorized: "+err.Error(), http.StatusUnauthorized)
+		return
+	}
+
 	var req struct {
 		UserID int64 `json:"user_id"`
 	}
@@ -720,6 +936,11 @@ func (s *Server) handleLinkCreate(w http.ResponseWriter, r *http.Request) {
 
 	if req.UserID == 0 {
 		http.Error(w, "Missing user_id", http.StatusBadRequest)
+		return
+	}
+
+	if req.UserID != session.UserID {
+		http.Error(w, "Forbidden", http.StatusForbidden)
 		return
 	}
 
@@ -790,6 +1011,13 @@ func (s *Server) handleLinkComplete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	token, tokenHash := generateSessionToken()
+	_, err = s.db.CreateSession(link.UserID, device.DeviceID, tokenHash, 30*24*time.Hour)
+	if err != nil {
+		http.Error(w, "Failed to create session", http.StatusInternalServerError)
+		return
+	}
+
 	user, _ := s.db.GetUserByID(link.UserID)
 
 	w.Header().Set("Content-Type", "application/json")
@@ -799,6 +1027,7 @@ func (s *Server) handleLinkComplete(w http.ResponseWriter, r *http.Request) {
 		"username":    user.Username,
 		"device_id":   device.DeviceID,
 		"public_key":  user.PublicKey,
+		"token":       token,
 		"server_time": time.Now().Unix(),
 	})
 
@@ -811,18 +1040,13 @@ func (s *Server) handleDevicesList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	userIDStr := r.URL.Query().Get("user_id")
-	if userIDStr == "" {
-		http.Error(w, "Missing user_id", http.StatusBadRequest)
-		return
-	}
-
-	userID, err := strconv.ParseInt(userIDStr, 10, 64)
+	session, err := s.authenticate(r)
 	if err != nil {
-		http.Error(w, "Invalid user_id", http.StatusBadRequest)
+		http.Error(w, "Unauthorized: "+err.Error(), http.StatusUnauthorized)
 		return
 	}
 
+	userID := session.UserID
 	devices, err := s.db.GetUserDevices(userID)
 	if err != nil {
 		http.Error(w, "Database error", http.StatusInternalServerError)
@@ -855,6 +1079,12 @@ func (s *Server) handleDeviceRevoke(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	session, err := s.authenticate(r)
+	if err != nil {
+		http.Error(w, "Unauthorized: "+err.Error(), http.StatusUnauthorized)
+		return
+	}
+
 	var req struct {
 		UserID   int64  `json:"user_id"`
 		DeviceID string `json:"device_id"`
@@ -865,13 +1095,18 @@ func (s *Server) handleDeviceRevoke(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if req.UserID != session.UserID {
+		http.Error(w, "Forbidden", http.StatusForbidden)
+		return
+	}
+
 	device, err := s.db.GetDeviceByID(req.DeviceID)
 	if err != nil || device == nil {
 		http.Error(w, "Device not found", http.StatusNotFound)
 		return
 	}
 
-	if device.UserID != req.UserID {
+	if device.UserID != session.UserID {
 		http.Error(w, "Device does not belong to user", http.StatusForbidden)
 		return
 	}
@@ -880,6 +1115,8 @@ func (s *Server) handleDeviceRevoke(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Failed to revoke device", http.StatusInternalServerError)
 		return
 	}
+
+	s.hub.DisconnectDevice(req.DeviceID)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{

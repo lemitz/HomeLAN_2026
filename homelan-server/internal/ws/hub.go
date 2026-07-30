@@ -43,8 +43,8 @@ type Hub struct {
 
 // BroadcastMessage - сообщение для отправки
 type BroadcastMessage struct {
-	RecipientID int64  // 0 = всем
-	Data        []byte
+	RecipientID   int64 // 0 = всем
+	Data          []byte
 	ExcludeDevice string // не отправлять этому устройству
 }
 
@@ -184,4 +184,16 @@ func (h *Hub) IsDeviceOnline(deviceID string) bool {
 	defer h.mu.RUnlock()
 	_, ok := h.clients[deviceID]
 	return ok
+}
+
+// DisconnectDevice принудительно разрывает соединение с устройством
+func (h *Hub) DisconnectDevice(deviceID string) {
+	h.mu.Lock()
+	client, ok := h.clients[deviceID]
+	if ok {
+		delete(h.clients, deviceID)
+		close(client.send)
+		client.conn.Close()
+	}
+	h.mu.Unlock()
 }

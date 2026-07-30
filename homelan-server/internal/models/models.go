@@ -67,3 +67,14 @@ type SyncCursor struct {
 	LastSeqID int64  `json:"last_seq_id"`
 	UpdatedAt int64  `json:"updated_at"`
 }
+
+// Session - сессия пользователя
+type Session struct {
+	ID        int64  `json:"id"`
+	TokenHash string `json:"token_hash"`
+	UserID    int64  `json:"user_id"`
+	DeviceID  string `json:"device_id"`
+	CreatedAt int64  `json:"created_at"`
+	ExpiresAt int64  `json:"expires_at"`
+	IsRevoked bool   `json:"is_revoked"`
+}

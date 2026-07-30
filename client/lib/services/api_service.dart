@@ -6,8 +6,18 @@ import 'time_service.dart';
 
 class ApiService {
   final String baseUrl;
+  String? token;
   
-  ApiService({required this.baseUrl});
+  ApiService({required this.baseUrl, this.token});
+
+  Map<String, String> _getHeaders() {
+    final headers = <String, String>{};
+    if (token != null) {
+      headers['X-Session-Token'] = token!;
+      headers['Authorization'] = 'Bearer $token';
+    }
+    return headers;
+  }
 
   Future<Map<String, dynamic>> register({
     required String username,
@@ -31,7 +41,7 @@ class ApiService {
 
     final response = await http.post(
       Uri.parse('$baseUrl/api/register'),
-      headers: {'Content-Type': 'application/json'},
+      headers: {'Content-Type': 'application/json', ..._getHeaders()},
       body: jsonEncode(body),
     );
 
@@ -66,7 +76,7 @@ class ApiService {
 
     final response = await http.post(
       Uri.parse('$baseUrl/api/login'),
-      headers: {'Content-Type': 'application/json'},
+      headers: {'Content-Type': 'application/json', ..._getHeaders()},
       body: jsonEncode(body),
     );
 
@@ -84,7 +94,10 @@ class ApiService {
   }
 
   Future<Map<String, dynamic>> getUser(int userId) async {
-    final response = await http.get(Uri.parse('$baseUrl/api/user/$userId'));
+    final response = await http.get(
+      Uri.parse('$baseUrl/api/user/$userId'),
+      headers: _getHeaders(),
+    );
     
     if (response.statusCode == 200) {
       return jsonDecode(response.body);
@@ -94,7 +107,10 @@ class ApiService {
   }
 
   Future<Map<String, dynamic>> getHealth() async {
-    final response = await http.get(Uri.parse('$baseUrl/health'));
+    final response = await http.get(
+      Uri.parse('$baseUrl/health'),
+      headers: _getHeaders(),
+    );
     if (response.statusCode == 200) {
       final data = jsonDecode(response.body);
       
@@ -109,7 +125,10 @@ class ApiService {
   }
 
   Future<int> getServerTime() async {
-    final response = await http.get(Uri.parse('$baseUrl/api/time'));
+    final response = await http.get(
+      Uri.parse('$baseUrl/api/time'),
+      headers: _getHeaders(),
+    );
     if (response.statusCode == 200) {
       final data = jsonDecode(response.body);
       final serverTime = data['server_time'] ?? 0;
@@ -127,6 +146,7 @@ class ApiService {
   Future<Map<String, dynamic>?> getPartner(int userId) async {
     final response = await http.get(
       Uri.parse('$baseUrl/api/partner?user_id=$userId'),
+      headers: _getHeaders(),
     );
 
     if (response.statusCode == 200) {
@@ -155,6 +175,7 @@ class ApiService {
     final uri = Uri.parse('$baseUrl/api/files/upload');
     
     final request = http.MultipartRequest('POST', uri);
+    request.headers.addAll(_getHeaders());
     
     request.fields['user_id'] = userId.toString();
     request.fields['file_name'] = base64Encode(utf8.encode(fileName));
@@ -183,6 +204,7 @@ class ApiService {
   Future<Uint8List> downloadFile(String fileId) async {
     final response = await http.get(
       Uri.parse('$baseUrl/api/files/$fileId'),
+      headers: _getHeaders(),
     );
     
     if (response.statusCode == 200) {
@@ -195,6 +217,7 @@ class ApiService {
   Future<Map<String, dynamic>> getFileInfo(String fileId) async {
     final response = await http.get(
       Uri.parse('$baseUrl/api/files/$fileId/info'),
+      headers: _getHeaders(),
     );
     
     if (response.statusCode == 200) {
@@ -225,7 +248,7 @@ class ApiService {
 
     final response = await http.post(
       Uri.parse('$baseUrl/api/devices/link/create'),
-      headers: {'Content-Type': 'application/json'},
+      headers: {'Content-Type': 'application/json', ..._getHeaders()},
       body: jsonEncode(body),
     );
 
@@ -260,7 +283,7 @@ class ApiService {
 
     final response = await http.post(
       Uri.parse('$baseUrl/api/devices/link/complete'),
-      headers: {'Content-Type': 'application/json'},
+      headers: {'Content-Type': 'application/json', ..._getHeaders()},
       body: jsonEncode(body),
     );
 
@@ -278,6 +301,7 @@ class ApiService {
   Future<List<Map<String, dynamic>>> getDevices(int userId) async {
     final response = await http.get(
       Uri.parse('$baseUrl/api/devices?user_id=$userId'),
+      headers: _getHeaders(),
     );
 
     if (response.statusCode == 200) {
@@ -297,7 +321,7 @@ class ApiService {
   }) async {
     final response = await http.post(
       Uri.parse('$baseUrl/api/devices/revoke'),
-      headers: {'Content-Type': 'application/json'},
+      headers: {'Content-Type': 'application/json', ..._getHeaders()},
       body: jsonEncode({
         'user_id': userId,
         'device_id': deviceId,
@@ -317,5 +341,5 @@ class ApiException implements Exception {
   ApiException(this.statusCode, this.message);
 
   @override
-  String toString() => 'ApiException($statusCode): $message';
+  String toString() => 'ApiException: [$statusCode] $message';
 }

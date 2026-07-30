@@ -97,6 +97,7 @@ class _NewDeviceLinkScreenState extends State<NewDeviceLinkScreen> {
         userId: result['user_id'],
         username: result['username'],
         deviceId: _deviceId!,
+        token: result['token'] as String?,
       );
       
       if (mounted) {
