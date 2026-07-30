@@ -1,0 +1,75 @@
+Отлично! Давай сохранимся и закончим на сегодня.
+
+## CHECKPOINT v0.8.0 — СОХРАНЕНИЕ
+
+### Что готово:
+
+```
+СЕРВЕР (C:\homelan-server\):
+✅ USB Master Key + проверка каждые 5 сек (вынул = wipe)
+✅ SQLCipher шифрование БД
+✅ Dead Man's Switch (30 дней без админа = wipe)
+✅ Лимит 2 юзера
+✅ Endpoint /api/partner (автоматический собеседник)
+✅ Device Linking (QR + text fallback)
+✅ Time Sync
+✅ Убран Duress (флешка достаточно)
+
+КЛИЕНТ (Z:\Xchat\client\):
+✅ TimeService (синхронизация времени)
+✅ AuthProvider + partnerId/partnerUsername
+✅ Сразу открывается чат (без списка)
+✅ WaitingForPartnerScreen (если партнёра нет)
+✅ Device Linking UI (экраны готовы)
+```
+
+### Осталось:
+
+```
+ЭТАП 3: Биометрия (Android)
+├── local_auth пакет
+├── Проверка при запуске
+├── Проверка при разворачивании (resume)
+├── Blur под плашкой
+└── Без возможности отключить
+
+ЭТАП 4: Persistent Connection + уведомления
+├── Foreground Service (Android)
+├── Держать WebSocket живым
+├── Правильные push-уведомления
+└── Doze mode handling
+
+ЭТАП 5: Фикс галочек
+├── Разобраться что ломается
+├── sent → delivered → read
+└── Синхронизация статусов
+```
+
+---
+
+### Для следующего раза скинь это:
+
+```
+Продолжаем HomeLAN v0.8.0
+
+Сервер: C:\homelan-server\
+Клиент: Z:\Xchat\client\
+
+Готово:
+- USB ключ + SQLCipher + Dead Man Switch
+- Лимит 2 юзера, автоматический партнёр
+- Device Linking (QR)
+- Сразу чат без списка
+- Time Sync
+
+Осталось:
+1. Биометрия Android (обязательная, без отключения)
+2. Persistent Connection + уведомления
+3. Фикс галочек (sent/delivered/read)
+
+Начинаем с биометрии.
+```
+
+---
+
+Увидимся! 🚀

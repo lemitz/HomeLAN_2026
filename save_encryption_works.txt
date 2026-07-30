@@ -1,0 +1,168 @@
+Согласен, бро! Сохраняемся 💾
+
+---
+
+# HOMELAN MESSENGER — CHECKPOINT v0.4.0-e2e
+
+## Статус проекта
+
+```
+✅ СЕРВЕР: работает, баги пофикшены
+✅ E2E ШИФРОВАНИЕ: работает (X25519 + ChaCha20-Poly1305)
+✅ КЛИЕНТ WINDOWS: работает
+✅ КЛИЕНТ ANDROID: APK собран
+✅ ПЕРЕПИСКА: шифруется/дешифруется корректно
+✅ УДАЛЕНИЕ ЧАТОВ: ПКМ (Windows) + долгий тап (Android)
+✅ ВАЛИДАЦИЯ СЕССИИ: автоматический wipe при невалидной сессии
+```
+
+---
+
+## Структура проекта
+
+```
+Z:\Xchat\
+├── server\
+│   ├── cmd\server\main.go
+│   ├── internal\
+│   │   ├── config\config.go
+│   │   ├── db\db.go                 ← ИСПРАВЛЕН (CreateOrUpdateDevice, is_deleted фильтр)
+│   │   ├── models\models.go
+│   │   ├── utils\
+│   │   │   ├── disk_windows.go
+│   │   │   └── disk_linux.go
+│   │   └── ws\
+│   │       ├── hub.go
+│   │       └── client.go
+│   ├── config.yaml
+│   ├── go.mod
+│   ├── go.sum
+│   └── homelan-server.exe
+│
+└── client\
+    ├── lib\
+    │   ├── main.dart                ← ОБНОВЛЁН (CryptoService интеграция)
+    │   ├── models\
+    │   │   ├── user.dart
+    │   │   ├── message.dart
+    │   │   ├── chat.dart
+    │   │   └── models.dart
+    │   ├── services\
+    │   │   ├── api_service.dart     ← ОБНОВЛЁН (publicKey передача)
+    │   │   ├── websocket_service.dart ← ОБНОВЛЁН (sendEncryptedMessage)
+    │   │   ├── database_service.dart  ← ОБНОВЛЁН (deleteMessagesForUser)
+    │   │   ├── crypto_service.dart    ← НОВЫЙ (E2E шифрование)
+    │   │   └── services.dart
+    │   ├── providers\
+    │   │   ├── auth_provider.dart     ← ОБНОВЛЁН (fullWipe, validateSession)
+    │   │   ├── chat_provider.dart     ← ОБНОВЛЁН (encrypt/decrypt, deleteChat)
+    │   │   └── providers.dart
+    │   ├── screens\
+    │   │   ├── login_screen.dart
+    │   │   ├── register_screen.dart
+    │   │   ├── chat_list_screen.dart  ← ОБНОВЛЁН (ПКМ меню, долгий тап)
+    │   │   ├── chat_screen.dart
+    │   │   ├── settings_screen.dart   ← ОБНОВЛЁН (полная очистка)
+    │   │   └── screens.dart
+    │   └── widgets\
+    │       ├── message_bubble.dart    ← ОБНОВЛЁН (расшифровка, иконка замка)
+    │       ├── chat_tile.dart
+    │       └── widgets.dart
+    ├── pubspec.yaml
+    └── android\
+```
+
+---
+
+## Команды
+
+**Сервер:**
+```powershell
+cd Z:\Xchat\server
+go build -o homelan-server.exe ./cmd/server
+.\homelan-server.exe
+```
+
+**Клиент Windows:**
+```powershell
+cd Z:\Xchat\client
+flutter run -d windows
+```
+
+**Клиент Android APK:**
+```powershell
+cd Z:\Xchat\client
+flutter build apk --release
+# APK: Z:\Xchat\client\build\app\outputs\flutter-apk\app-release.apk
+```
+
+**Очистка данных:**
+```powershell
+# Windows клиент
+Remove-Item -Recurse -Force "$env:APPDATA\com.homelan" -ErrorAction SilentlyContinue
+Remove-Item -Recurse -Force "$env:LOCALAPPDATA\com.homelan" -ErrorAction SilentlyContinue
+Remove-Item "$env:USERPROFILE\Documents\homelan_client.db" -ErrorAction SilentlyContinue
+
+# Сервер
+cd Z:\Xchat\server
+Remove-Item -Recurse -Force data
+```
+
+---
+
+## Настройки
+
+**IP сервера** в `Z:\Xchat\client\lib\main.dart`:
+```dart
+const String serverUrl = 'http://192.168.100.100:8080';
+```
+
+---
+
+## Ключевые фичи v0.4.0
+
+| Фича | Реализация |
+|------|------------|
+| E2E шифрование | X25519 (ключи) + ChaCha20-Poly1305 (сообщения) |
+| Генерация ключей | В изоляте (без лагов UI) |
+| Хранение ключей | SharedPreferences (приватный) + сервер (публичный) |
+| Удаление чатов | ПКМ на Windows, долгий тап на Android |
+| Валидация сессии | При старте проверяет юзера на сервере |
+| Полная очистка | Удаляет ключи, сообщения, кэш |
+
+---
+
+## Следующий этап: Файлы и картинки
+
+```
+TODO:
+├── HTTP upload с Range headers
+├── Шифрование файлов на клиенте
+├── Progress bar при загрузке
+├── Превью картинок
+├── Ограничение размера (2GB max)
+└── io.LimitReader на сервере
+```
+
+---
+
+## В новом чате напиши:
+
+```
+Продолжаем HomeLAN Messenger v0.4.0-e2e
+
+Готово:
+- Сервер Go (WebSocket + HTTP API + SQLite)
+- Клиент Flutter (Windows + Android APK)  
+- E2E шифрование (X25519 + ChaCha20-Poly1305)
+- Удаление чатов, валидация сессии, полная очистка
+
+Сейчас делаем:
+- Отправка файлов и картинок с E2E шифрованием
+```
+
+---
+
+Сохранено! 💾 
+
+Теперь го пилить файлы. Скинь мне текущий **`chat_screen.dart`** — там будем добавлять кнопку прикрепления файла и отображение картинок. 📎🖼️

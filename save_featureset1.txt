@@ -1,0 +1,144 @@
+Сохранение (Checkpoint v0.6.0)
+text
+
+# HOMELAN MESSENGER — CHECKPOINT v0.6.0
+
+## Статус проекта
+
+✅ СЕРВЕР: работает
+✅ E2E ШИФРОВАНИЕ: работает
+✅ КЛИЕНТ WINDOWS: работает
+✅ КЛИЕНТ ANDROID: APK собирается
+✅ ФАЙЛЫ И КАРТИНКИ: работает
+✅ ГАЛОЧКИ ПРОЧИТАНО: одна = доставлено, две = прочитано
+✅ БЕЙДЖ НЕПРОЧИТАННЫХ: работает
+✅ ПОИСК С WILDCARDS: glob-стиль (бел*)
+✅ ИНДИКАТОР "ПЕЧАТАЕТ...": работает
+✅ РЕДАКТИРОВАНИЕ КОНТАКТА: имя + цвет аватарки
+✅ ДАТЫ-РАЗДЕЛИТЕЛИ: как в Телеге
+✅ КНОПКА ВНИЗ: появляется при скролле
+✅ АВТОРЕСАЙЗ ПОЛЯ ВВОДА: с лимитом 150px
+✅ КАСТОМНЫЕ ЦВЕТА БАБЛОВ: в настройках
+✅ ПАСХАЛКА E2E: рандомные фразы
+
+---
+
+## Осталось реализовать
+
+| # | Фича | Сложность |
+|---|------|-----------|
+| 11 | Reply на сообщение | 🔴 Сложная |
+| 12 | Анимации и polish | 🟡 Средняя |
+| 13 | Автоудаление по таймеру | 🟡 Средняя |
+| 14 | Свитч уведомлений | 🟢 Лёгкая |
+| 15 | О приложении | 🟢 Лёгкая |
+| 16 | Мои устройства | ⏳ После Device Linking |
+| 17 | Очистка + ленивая синхронизация | 🟡 Средняя |
+
+---
+
+## Структура проекта
+
+Z:\Xchat\
+├── server\
+│   ├── cmd\server\main.go
+│   ├── internal\
+│   │   ├── config\config.go
+│   │   ├── db\db.go
+│   │   ├── models\models.go
+│   │   ├── utils\
+│   │   │   ├── disk_windows.go
+│   │   │   └── disk_linux.go
+│   │   └── ws\
+│   │       ├── hub.go
+│   │       └── client.go          ← typing handler
+│   ├── config.yaml
+│   ├── go.mod
+│   └── homelan-server.exe
+│
+└── client\
+    ├── lib\
+    │   ├── main.dart
+    │   ├── models\
+    │   │   ├── user.dart
+    │   │   ├── message.dart
+    │   │   ├── chat.dart
+    │   │   └── models.dart
+    │   ├── services\
+    │   │   ├── api_service.dart
+    │   │   ├── websocket_service.dart  ← sendTyping
+    │   │   ├── database_service.dart   ← contacts, settings tables
+    │   │   ├── crypto_service.dart
+    │   │   ├── notification_service.dart
+    │   │   └── services.dart
+    │   ├── providers\
+    │   │   ├── auth_provider.dart
+    │   │   ├── chat_provider.dart      ← typing, search, bubble colors
+    │   │   └── providers.dart
+    │   ├── screens\
+    │   │   ├── login_screen.dart
+    │   │   ├── register_screen.dart
+    │   │   ├── chat_list_screen.dart   ← unread badge
+    │   │   ├── chat_screen.dart        ← search, typing, dates, scroll btn
+    │   │   ├── settings_screen.dart    ← bubble colors, E2E easter egg
+    │   │   └── screens.dart
+    │   └── widgets\
+    │       ├── message_bubble.dart     ← custom colors, status icons
+    │       ├── chat_tile.dart          ← unread count
+    │       └── widgets.dart
+    └── pubspec.yaml
+
+---
+
+## Команды
+
+Сервер:
+cd Z:\Xchat\server
+go build -o homelan-server.exe ./cmd/server
+.\homelan-server.exe
+
+Клиент Windows:
+cd Z:\Xchat\client
+flutter run -d windows
+
+Клиент Android APK:
+cd Z:\Xchat\client
+flutter build apk --release
+
+---
+
+## Следующие шаги
+
+Рекомендуемый порядок:
+14 (свитч уведомлений) → 15 (о приложении) → 13 (автоудаление) → 11 (reply) → 17 (ленивая синхронизация) → 12 (анимации)
+
+---
+
+## В новом чате напиши:
+
+Продолжаем HomeLAN Messenger v0.6.0
+
+Готово:
+- Сервер Go + Клиент Flutter
+- E2E шифрование
+- Галочки (одна = доставлено, две = прочитано)
+- Бейдж непрочитанных
+- Поиск с glob (*)
+- "Печатает..." индикатор
+- Редактирование контакта
+- Даты-разделители
+- Кнопка вниз
+- Авторесайз поля ввода
+- Кастомные цвета баблов
+- Пасхалка E2E
+
+Осталось:
+- Reply на сообщение
+- Автоудаление по таймеру
+- Свитч уведомлений
+- О приложении
+- Очистка при выходе + ленивая синхронизация
+- Анимации
+
+Что дальше?
+Сохранил! Готов продолжать когда скажешь 🚀

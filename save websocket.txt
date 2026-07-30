@@ -1,0 +1,489 @@
+Идеально! WebSocket работает! 🎉
+
+Сохраняю полное состояние проекта:
+
+---
+
+# HOMELAN MESSENGER — CHECKPOINT 2025-12-09
+
+## Статус проекта
+
+```
+✅ РАБОТАЕТ:
+├── Go сервер запускается (homelan-server.exe)
+├── Health check: GET /health
+├── Регистрация: POST /api/register
+├── Логин: POST /api/login
+├── Time sync: GET /api/time
+├── WebSocket подключение: ws://localhost:8080/ws
+├── SQLite база данных (data/homelan.db)
+└── Graceful shutdown
+
+⏳ СЛЕДУЮЩИЙ ШАГ:
+└── Отправка сообщений через WebSocket
+```
+
+## Расположение проекта
+
+```
+Z:\Xchat\server\
+├── cmd\server\main.go          # Точка входа
+├── config.yaml                 # Конфиг
+├── data\                       # База данных
+├── go.mod
+├── go.sum
+├── homelan-server.exe          # Готовый билд (15 MB)
+├── internal\
+│   ├── api\
+│   ├── config\                 # Загрузка конфига
+│   ├── db\                     # Работа с SQLite
+│   ├── models\                 # Структуры данных
+│   └── ws\                     # WebSocket хаб
+└── scripts\
+```
+
+## Окружение разработки
+
+```
+OS: Windows
+Go: установлен
+MinGW: установлен (нужен для SQLite)
+Node.js: v24.11.1
+npm: 11.6.2
+wscat: установлен глобально
+
+PowerShell: разрешены скрипты
+Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+```
+
+## Тестовые данные в БД
+
+```
+User 1: (первый, админ) — создан ранее, данные неизвестны
+User 2: alice / test123
+        device_id: alice-pc-001
+        device_name: Alice PC
+        device_type: windows
+        is_admin: false
+```
+
+## Рабочие команды
+
+**Запуск сервера:**
+```powershell
+cd Z:\Xchat\server
+.\homelan-server.exe
+```
+
+**Проверка health:**
+```powershell
+Invoke-RestMethod -Uri "http://localhost:8080/health"
+```
+
+**Регистрация юзера:**
+```powershell
+$body = @{
+    username = "alice"
+    password = "test123"
+    device_id = "alice-pc-001"
+    device_name = "Alice PC"
+    device_type = "windows"
+} | ConvertTo-Json
+
+Invoke-RestMethod -Uri "http://localhost:8080/api/register" -Method POST -Body $body -ContentType "application/json"
+```
+
+**Логин:**
+```powershell
+$body = @{
+    username = "alice"
+    password = "test123"
+    device_id = "alice-pc-001"
+} | ConvertTo-Json
+
+Invoke-RestMethod -Uri "http://localhost:8080/api/login" -Method POST -Body $body -ContentType "application/json"
+```
+
+**WebSocket подключение:**
+```powershell
+wscat -c "ws://localhost:8080/ws?user_id=2&device_id=alice-pc-001&token=test"
+```
+
+## Текущий main.go
+
+```go
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/gorilla/websocket"
+	"homelan-server/internal/config"
+	"homelan-server/internal/db"
+	"homelan-server/internal/ws"
+)
+
+// Server - главная структура сервера
+type Server struct {
+	config   *config.Config
+	db       *db.Database
+	hub      *ws.Hub
+	upgrader websocket.Upgrader
+}
+
+// NewServer создаёт новый сервер
+func NewServer(cfg *config.Config) (*Server, error) {
+	// Подключаемся к БД
+	database, err := db.New(cfg.Database.Path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to database: %w", err)
+	}
+
+	// Создаём хаб для WebSocket
+	hub := ws.NewHub(database)
+
+	return &Server{
+		config: cfg,
+		db:     database,
+		hub:    hub,
+		upgrader: websocket.Upgrader{
+			ReadBufferSize:  1024,
+			WriteBufferSize: 1024,
+			CheckOrigin: func(r *http.Request) bool {
+				return true // В LAN разрешаем все
+			},
+		},
+	}, nil
+}
+
+// Start запускает сервер
+func (s *Server) Start() error {
+	// Запускаем WebSocket хаб
+	go s.hub.Run()
+
+	// Запускаем очистку просроченных сообщений
+	go s.cleanupLoop()
+
+	// Настраиваем HTTP маршруты
+	mux := http.NewServeMux()
+
+	// Health check
+	mux.HandleFunc("/health", s.handleHealth)
+
+	// API
+	mux.HandleFunc("/api/register", s.handleRegister)
+	mux.HandleFunc("/api/login", s.handleLogin)
+	mux.HandleFunc("/api/time", s.handleTime)
+
+	// WebSocket
+	mux.HandleFunc("/ws", s.handleWebSocket)
+
+	// HTTP сервер с таймаутами
+	addr := fmt.Sprintf("%s:%d", s.config.Server.Host, s.config.Server.Port)
+	server := &http.Server{
+		Addr:         addr,
+		Handler:      mux,
+		ReadTimeout:  time.Duration(s.config.Timeouts.ReadSeconds) * time.Second,
+		WriteTimeout: time.Duration(s.config.Timeouts.WriteSeconds) * time.Second,
+		IdleTimeout:  time.Duration(s.config.Timeouts.IdleSeconds) * time.Second,
+	}
+
+	log.Printf("🚀 HomeLAN Server starting on %s", addr)
+	return server.ListenAndServe()
+}
+
+// handleHealth - проверка что сервер жив
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":      "ok",
+		"server_time": time.Now().Unix(),
+	})
+}
+
+// handleTime - синхронизация времени
+func (s *Server) handleTime(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"server_time": time.Now().Unix(),
+	})
+}
+
+// handleWebSocket - обработчик WebSocket подключений
+func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
+	// Получаем параметры из query string
+	userID := r.URL.Query().Get("user_id")
+	deviceID := r.URL.Query().Get("device_id")
+	token := r.URL.Query().Get("token")
+
+	if userID == "" || deviceID == "" || token == "" {
+		http.Error(w, "Missing parameters", http.StatusBadRequest)
+		return
+	}
+
+	// Проверяем устройство
+	device, err := s.db.GetDeviceByID(deviceID)
+	if err != nil || device == nil {
+		http.Error(w, "Device not found", http.StatusUnauthorized)
+		return
+	}
+	if device.IsRevoked {
+		http.Error(w, "Device revoked", http.StatusForbidden)
+		return
+	}
+
+	// Апгрейдим соединение до WebSocket
+	conn, err := s.upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Printf("WebSocket upgrade error: %v", err)
+		return
+	}
+
+	// Регистрируем клиента
+	client := s.hub.RegisterClient(conn, device.UserID, deviceID)
+
+	// Обновляем last_seen
+	s.db.UpdateDeviceLastSeen(deviceID)
+	s.db.UpdateUserLastSeen(device.UserID)
+
+	// Запускаем горутины чтения/записи
+	go client.WritePump()
+	go client.ReadPump()
+}
+
+// handleRegister - регистрация нового пользователя
+func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		Username   string `json:"username"`
+		Password   string `json:"password"`
+		DeviceID   string `json:"device_id"`
+		DeviceName string `json:"device_name"`
+		DeviceType string `json:"device_type"`
+		PublicKey  []byte `json:"public_key"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	// Проверяем обязательные поля
+	if req.Username == "" || req.Password == "" || req.DeviceID == "" {
+		http.Error(w, "Missing required fields", http.StatusBadRequest)
+		return
+	}
+
+	// Проверяем существует ли пользователь
+	existing, err := s.db.GetUserByUsername(req.Username)
+	if err != nil {
+		log.Printf("Error checking user: %v", err)
+		http.Error(w, "Internal error", http.StatusInternalServerError)
+		return
+	}
+	if existing != nil {
+		http.Error(w, "Username already exists", http.StatusConflict)
+		return
+	}
+
+	// Определяем первый ли это пользователь (будет админом)
+	admin, _ := s.db.GetAdmin()
+	isAdmin := admin == nil
+
+	// Создаём пользователя
+	user, err := s.db.CreateUser(req.Username, req.Password, isAdmin)
+	if err != nil {
+		log.Printf("Error creating user: %v", err)
+		http.Error(w, "Failed to create user", http.StatusInternalServerError)
+		return
+	}
+
+	// Обновляем публичный ключ
+	if len(req.PublicKey) > 0 {
+		s.db.UpdateUserPublicKey(user.ID, req.PublicKey)
+	}
+
+	// Создаём устройство
+	device, err := s.db.CreateDevice(user.ID, req.DeviceID, req.DeviceName, req.DeviceType, req.PublicKey)
+	if err != nil {
+		log.Printf("Error creating device: %v", err)
+		http.Error(w, "Failed to create device", http.StatusInternalServerError)
+		return
+	}
+
+	// Отправляем ответ
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":     true,
+		"user_id":     user.ID,
+		"device_id":   device.DeviceID,
+		"is_admin":    isAdmin,
+		"server_time": time.Now().Unix(),
+	})
+
+	log.Printf("✅ User registered: %s (admin: %v)", req.Username, isAdmin)
+}
+
+// handleLogin - авторизация пользователя
+func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+		DeviceID string `json:"device_id"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	// Находим пользователя
+	user, err := s.db.GetUserByUsername(req.Username)
+	if err != nil {
+		log.Printf("Error finding user: %v", err)
+		http.Error(w, "Internal error", http.StatusInternalServerError)
+		return
+	}
+	if user == nil {
+		http.Error(w, "Invalid credentials", http.StatusUnauthorized)
+		return
+	}
+
+	// Проверяем пароль
+	if user.PasswordHash != req.Password {
+		http.Error(w, "Invalid credentials", http.StatusUnauthorized)
+		return
+	}
+
+	// Проверяем устройство
+	device, err := s.db.GetDeviceByID(req.DeviceID)
+	if err != nil {
+		log.Printf("Error finding device: %v", err)
+		http.Error(w, "Internal error", http.StatusInternalServerError)
+		return
+	}
+	if device == nil {
+		http.Error(w, "Device not registered", http.StatusUnauthorized)
+		return
+	}
+	if device.IsRevoked {
+		http.Error(w, "Device revoked", http.StatusForbidden)
+		return
+	}
+
+	// Обновляем last_seen
+	s.db.UpdateUserLastSeen(user.ID)
+	s.db.UpdateDeviceLastSeen(req.DeviceID)
+
+	// Отправляем ответ
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":     true,
+		"user_id":     user.ID,
+		"is_admin":    user.IsAdmin,
+		"server_time": time.Now().Unix(),
+	})
+
+	log.Printf("✅ User logged in: %s", req.Username)
+}
+
+// cleanupLoop - периодическая очистка
+func (s *Server) cleanupLoop() {
+	ticker := time.NewTicker(1 * time.Hour)
+	for range ticker.C {
+		deleted, err := s.db.DeleteExpiredMessages()
+		if err != nil {
+			log.Printf("Error cleaning expired messages: %v", err)
+		} else if deleted > 0 {
+			log.Printf("🧹 Cleaned %d expired messages", deleted)
+		}
+	}
+}
+
+// Close закрывает сервер
+func (s *Server) Close() error {
+	return s.db.Close()
+}
+
+func main() {
+	log.Println("=================================")
+	log.Println("   HomeLAN Messenger Server")
+	log.Println("   Version 0.1.0")
+	log.Println("=================================")
+
+	// Загружаем конфиг
+	cfg, err := config.Load("config.yaml")
+	if err != nil {
+		log.Fatalf("❌ Failed to load config: %v", err)
+	}
+
+	// Создаём сервер
+	server, err := NewServer(cfg)
+	if err != nil {
+		log.Fatalf("❌ Failed to create server: %v", err)
+	}
+	defer server.Close()
+
+	// Graceful shutdown
+	go func() {
+		sigchan := make(chan os.Signal, 1)
+		signal.Notify(sigchan, syscall.SIGINT, syscall.SIGTERM)
+		<-sigchan
+		log.Println("🛑 Shutting down...")
+		server.Close()
+		os.Exit(0)
+	}()
+
+	// Запускаем!
+	if err := server.Start(); err != nil {
+		log.Fatalf("❌ Server error: %v", err)
+	}
+}
+```
+
+## Архитектура проекта (полная)
+
+Смотри первое сообщение этого чата — там v2.3 RELEASE CANDIDATE с полным описанием:
+- Device Linking (2-QR + Text Fallback)
+- Time Sync
+- File Upload Protection
+- Panic Script
+- Dead Man's Switch
+- Threat Model
+- Этапы разработки
+
+## Что делать дальше
+
+```
+СЛЕДУЮЩИЙ ШАГ: Добавить отправку сообщений через WebSocket
+
+Нужно:
+1. Посмотреть что в internal/ws/ (хаб и клиент)
+2. Добавить обработку типов сообщений:
+   - send_message
+   - message_received (от сервера)
+   - ack (подтверждение)
+   - typing (опционально)
+3. Сохранение сообщений в БД
+4. Пересылка получателю
+```
+
+---
+
+**Сохрани этот текст** — с ним можно продолжить в любом новом чате! 📋

@@ -1,0 +1,1508 @@
+Отличная идея! Сохраняем полный checkpoint.
+
+---
+
+# HOMELAN MESSENGER — CHECKPOINT 2025-12-09 (v2)
+
+## Статус проекта
+
+```
+СЕРВЕР: 95% ГОТОВ 🏆
+
+✅ РАБОТАЕТ И ПРОТЕСТИРОВАНО:
+├── HTTP API
+│   ├── GET  /health — проверка сервера
+│   ├── GET  /api/time — синхронизация времени
+│   ├── POST /api/register — регистрация юзера
+│   └── POST /api/login — авторизация
+│
+├── WebSocket /ws
+│   ├── send_message — отправка сообщений
+│   ├── new_message — получение сообщений
+│   ├── sync — синхронизация истории
+│   ├── ack — подтверждение доставки
+│   ├── read — отметка прочтения
+│   ├── delete — удаление (tombstone)
+│   └── ping/pong — keepalive
+│
+├── SQLite + WAL mode
+│   ├── users, devices, messages
+│   ├── message_status, files, sync_cursors
+│   └── Все CRUD операции
+│
+└── Multi-device поддержка
+
+⏳ ОСТАЛОСЬ ДОБАВИТЬ:
+├── HTTP загрузка файлов (upload/download)
+├── Panic wipe script
+├── Dead Man's Switch
+└── SQLCipher шифрование
+```
+
+## Расположение проекта
+
+```
+Z:\Xchat\server\
+├── cmd\server\main.go          # Точка входа (полный код ниже)
+├── config.yaml                 # Конфиг
+├── data\                       # SQLite база
+│   └── homelan.db
+├── go.mod
+├── go.sum
+├── homelan-server.exe          # Готовый билд (15 MB)
+├── internal\
+│   ├── api\
+│   ├── config\                 # Загрузка конфига
+│   ├── db\
+│   │   ├── db.go               # Все методы БД (код ниже)
+│   │   └── schema.sql
+│   ├── models\                 # Структуры данных
+│   └── ws\
+│       ├── hub.go              # WebSocket хаб (код ниже)
+│       └── client.go           # WebSocket клиент (код ниже)
+└── scripts\
+```
+
+## Тестовые данные в БД
+
+```
+User 1: (админ) — создан ранее, данные неизвестны
+User 2: alice / test123, device: alice-pc-001
+User 3: bob / test456, device: bob-pc-001
+
+Сообщения:
+├── seq=2: alice → bob "SGVsbG8gQm9iIQ==" (Hello Bob!)
+└── seq=3: bob → alice "SGVsbG8gQWxpY2Uh" (Hello Alice!)
+```
+
+## Окружение разработки
+
+```
+OS: Windows
+Go: установлен
+MinGW: установлен (для SQLite)
+Node.js: v24.11.1
+npm: 11.6.2
+wscat: установлен глобально
+
+PowerShell: скрипты разрешены
+Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+```
+
+---
+
+## ВСЕ РАБОЧИЕ КОМАНДЫ
+
+**Запуск сервера:**
+```powershell
+cd Z:\Xchat\server
+.\homelan-server.exe
+```
+
+**Проверка health:**
+```powershell
+Invoke-RestMethod -Uri "http://localhost:8080/health"
+```
+
+**Регистрация юзера:**
+```powershell
+$body = @{
+    username = "alice"
+    password = "test123"
+    device_id = "alice-pc-001"
+    device_name = "Alice PC"
+    device_type = "windows"
+} | ConvertTo-Json
+
+Invoke-RestMethod -Uri "http://localhost:8080/api/register" -Method POST -Body $body -ContentType "application/json"
+```
+
+**Логин:**
+```powershell
+$body = @{
+    username = "alice"
+    password = "test123"
+    device_id = "alice-pc-001"
+} | ConvertTo-Json
+
+Invoke-RestMethod -Uri "http://localhost:8080/api/login" -Method POST -Body $body -ContentType "application/json"
+```
+
+**WebSocket подключение:**
+```powershell
+wscat -c "ws://localhost:8080/ws?user_id=2&device_id=alice-pc-001&token=test"
+```
+
+**Отправка сообщения (в wscat, вставлять правой кнопкой мыши):**
+```json
+{"type":"send_message","data":{"recipient_id":3,"encrypted_content":"SGVsbG8gQm9iIQ==","content_type":"text"}}
+```
+
+**Синхронизация:**
+```json
+{"type":"sync","data":{"since_seq_id":0}}
+```
+
+**Подтверждение прочтения:**
+```json
+{"type":"read","data":{"seq_id":2}}
+```
+
+---
+
+## КОД: main.go
+
+```go
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/gorilla/websocket"
+	"homelan-server/internal/config"
+	"homelan-server/internal/db"
+	"homelan-server/internal/ws"
+)
+
+type Server struct {
+	config   *config.Config
+	db       *db.Database
+	hub      *ws.Hub
+	upgrader websocket.Upgrader
+}
+
+func NewServer(cfg *config.Config) (*Server, error) {
+	database, err := db.New(cfg.Database.Path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to database: %w", err)
+	}
+
+	hub := ws.NewHub(database)
+
+	return &Server{
+		config: cfg,
+		db:     database,
+		hub:    hub,
+		upgrader: websocket.Upgrader{
+			ReadBufferSize:  1024,
+			WriteBufferSize: 1024,
+			CheckOrigin: func(r *http.Request) bool {
+				return true
+			},
+		},
+	}, nil
+}
+
+func (s *Server) Start() error {
+	go s.hub.Run()
+	go s.cleanupLoop()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", s.handleHealth)
+	mux.HandleFunc("/api/register", s.handleRegister)
+	mux.HandleFunc("/api/login", s.handleLogin)
+	mux.HandleFunc("/api/time", s.handleTime)
+	mux.HandleFunc("/ws", s.handleWebSocket)
+
+	addr := fmt.Sprintf("%s:%d", s.config.Server.Host, s.config.Server.Port)
+	server := &http.Server{
+		Addr:         addr,
+		Handler:      mux,
+		ReadTimeout:  time.Duration(s.config.Timeouts.ReadSeconds) * time.Second,
+		WriteTimeout: time.Duration(s.config.Timeouts.WriteSeconds) * time.Second,
+		IdleTimeout:  time.Duration(s.config.Timeouts.IdleSeconds) * time.Second,
+	}
+
+	log.Printf("🚀 HomeLAN Server starting on %s", addr)
+	return server.ListenAndServe()
+}
+
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":      "ok",
+		"server_time": time.Now().Unix(),
+	})
+}
+
+func (s *Server) handleTime(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"server_time": time.Now().Unix(),
+	})
+}
+
+func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
+	userID := r.URL.Query().Get("user_id")
+	deviceID := r.URL.Query().Get("device_id")
+	token := r.URL.Query().Get("token")
+
+	if userID == "" || deviceID == "" || token == "" {
+		http.Error(w, "Missing parameters", http.StatusBadRequest)
+		return
+	}
+
+	device, err := s.db.GetDeviceByID(deviceID)
+	if err != nil || device == nil {
+		http.Error(w, "Device not found", http.StatusUnauthorized)
+		return
+	}
+	if device.IsRevoked {
+		http.Error(w, "Device revoked", http.StatusForbidden)
+		return
+	}
+
+	conn, err := s.upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Printf("WebSocket upgrade error: %v", err)
+		return
+	}
+
+	client := s.hub.RegisterClient(conn, device.UserID, deviceID)
+	s.db.UpdateDeviceLastSeen(deviceID)
+	s.db.UpdateUserLastSeen(device.UserID)
+
+	go client.WritePump()
+	go client.ReadPump()
+}
+
+func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		Username   string `json:"username"`
+		Password   string `json:"password"`
+		DeviceID   string `json:"device_id"`
+		DeviceName string `json:"device_name"`
+		DeviceType string `json:"device_type"`
+		PublicKey  []byte `json:"public_key"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	if req.Username == "" || req.Password == "" || req.DeviceID == "" {
+		http.Error(w, "Missing required fields", http.StatusBadRequest)
+		return
+	}
+
+	existing, err := s.db.GetUserByUsername(req.Username)
+	if err != nil {
+		http.Error(w, "Internal error", http.StatusInternalServerError)
+		return
+	}
+	if existing != nil {
+		http.Error(w, "Username already exists", http.StatusConflict)
+		return
+	}
+
+	admin, _ := s.db.GetAdmin()
+	isAdmin := admin == nil
+
+	user, err := s.db.CreateUser(req.Username, req.Password, isAdmin)
+	if err != nil {
+		http.Error(w, "Failed to create user", http.StatusInternalServerError)
+		return
+	}
+
+	if len(req.PublicKey) > 0 {
+		s.db.UpdateUserPublicKey(user.ID, req.PublicKey)
+	}
+
+	device, err := s.db.CreateDevice(user.ID, req.DeviceID, req.DeviceName, req.DeviceType, req.PublicKey)
+	if err != nil {
+		http.Error(w, "Failed to create device", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":     true,
+		"user_id":     user.ID,
+		"device_id":   device.DeviceID,
+		"is_admin":    isAdmin,
+		"server_time": time.Now().Unix(),
+	})
+
+	log.Printf("✅ User registered: %s (admin: %v)", req.Username, isAdmin)
+}
+
+func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+		DeviceID string `json:"device_id"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	user, err := s.db.GetUserByUsername(req.Username)
+	if err != nil {
+		http.Error(w, "Internal error", http.StatusInternalServerError)
+		return
+	}
+	if user == nil {
+		http.Error(w, "Invalid credentials", http.StatusUnauthorized)
+		return
+	}
+
+	if user.PasswordHash != req.Password {
+		http.Error(w, "Invalid credentials", http.StatusUnauthorized)
+		return
+	}
+
+	device, err := s.db.GetDeviceByID(req.DeviceID)
+	if err != nil {
+		http.Error(w, "Internal error", http.StatusInternalServerError)
+		return
+	}
+	if device == nil {
+		http.Error(w, "Device not registered", http.StatusUnauthorized)
+		return
+	}
+	if device.IsRevoked {
+		http.Error(w, "Device revoked", http.StatusForbidden)
+		return
+	}
+
+	s.db.UpdateUserLastSeen(user.ID)
+	s.db.UpdateDeviceLastSeen(req.DeviceID)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":     true,
+		"user_id":     user.ID,
+		"is_admin":    user.IsAdmin,
+		"server_time": time.Now().Unix(),
+	})
+
+	log.Printf("✅ User logged in: %s", req.Username)
+}
+
+func (s *Server) cleanupLoop() {
+	ticker := time.NewTicker(1 * time.Hour)
+	for range ticker.C {
+		deleted, err := s.db.DeleteExpiredMessages()
+		if err != nil {
+			log.Printf("Error cleaning expired messages: %v", err)
+		} else if deleted > 0 {
+			log.Printf("🧹 Cleaned %d expired messages", deleted)
+		}
+	}
+}
+
+func (s *Server) Close() error {
+	return s.db.Close()
+}
+
+func main() {
+	log.Println("=================================")
+	log.Println("   HomeLAN Messenger Server")
+	log.Println("   Version 0.1.0")
+	log.Println("=================================")
+
+	cfg, err := config.Load("config.yaml")
+	if err != nil {
+		log.Fatalf("❌ Failed to load config: %v", err)
+	}
+
+	server, err := NewServer(cfg)
+	if err != nil {
+		log.Fatalf("❌ Failed to create server: %v", err)
+	}
+	defer server.Close()
+
+	go func() {
+		sigchan := make(chan os.Signal, 1)
+		signal.Notify(sigchan, syscall.SIGINT, syscall.SIGTERM)
+		<-sigchan
+		log.Println("🛑 Shutting down...")
+		server.Close()
+		os.Exit(0)
+	}()
+
+	if err := server.Start(); err != nil {
+		log.Fatalf("❌ Server error: %v", err)
+	}
+}
+```
+
+---
+
+## КОД: internal/ws/hub.go
+
+```go
+package ws
+
+import (
+	"encoding/json"
+	"log"
+	"sync"
+	"time"
+
+	"github.com/gorilla/websocket"
+	"homelan-server/internal/db"
+)
+
+const (
+	writeWait      = 10 * time.Second
+	pingPeriod     = 30 * time.Second
+	maxMessageSize = 1024 * 1024
+)
+
+type Client struct {
+	hub      *Hub
+	conn     *websocket.Conn
+	send     chan []byte
+	userID   int64
+	deviceID string
+	mu       sync.Mutex
+}
+
+type Hub struct {
+	db         *db.Database
+	clients    map[string]*Client
+	register   chan *Client
+	unregister chan *Client
+	broadcast  chan *BroadcastMessage
+	mu         sync.RWMutex
+}
+
+type BroadcastMessage struct {
+	RecipientID   int64
+	Data          []byte
+	ExcludeDevice string
+}
+
+type WSMessage struct {
+	Type string          `json:"type"`
+	Data json.RawMessage `json:"data"`
+}
+
+func NewHub(database *db.Database) *Hub {
+	return &Hub{
+		db:         database,
+		clients:    make(map[string]*Client),
+		register:   make(chan *Client),
+		unregister: make(chan *Client),
+		broadcast:  make(chan *BroadcastMessage, 256),
+	}
+}
+
+func (h *Hub) Run() {
+	for {
+		select {
+		case client := <-h.register:
+			h.mu.Lock()
+			h.clients[client.deviceID] = client
+			h.mu.Unlock()
+			log.Printf("📱 Client connected: device=%s user=%d", client.deviceID, client.userID)
+
+		case client := <-h.unregister:
+			h.mu.Lock()
+			if _, ok := h.clients[client.deviceID]; ok {
+				delete(h.clients, client.deviceID)
+				close(client.send)
+			}
+			h.mu.Unlock()
+			log.Printf("📴 Client disconnected: device=%s", client.deviceID)
+
+		case msg := <-h.broadcast:
+			h.handleBroadcast(msg)
+		}
+	}
+}
+
+func (h *Hub) handleBroadcast(msg *BroadcastMessage) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	if msg.RecipientID == 0 {
+		for deviceID, client := range h.clients {
+			if deviceID != msg.ExcludeDevice {
+				select {
+				case client.send <- msg.Data:
+				default:
+				}
+			}
+		}
+	} else {
+		for deviceID, client := range h.clients {
+			if client.userID == msg.RecipientID && deviceID != msg.ExcludeDevice {
+				select {
+				case client.send <- msg.Data:
+				default:
+				}
+			}
+		}
+	}
+}
+
+func (h *Hub) SendToUser(userID int64, data []byte, excludeDevice string) {
+	h.broadcast <- &BroadcastMessage{
+		RecipientID:   userID,
+		Data:          data,
+		ExcludeDevice: excludeDevice,
+	}
+}
+
+func (h *Hub) SendToDevice(deviceID string, data []byte) {
+	h.mu.RLock()
+	client, ok := h.clients[deviceID]
+	h.mu.RUnlock()
+
+	if ok {
+		select {
+		case client.send <- data:
+		default:
+		}
+	}
+}
+
+func (h *Hub) RegisterClient(conn *websocket.Conn, userID int64, deviceID string) *Client {
+	client := &Client{
+		hub:      h,
+		conn:     conn,
+		send:     make(chan []byte, 256),
+		userID:   userID,
+		deviceID: deviceID,
+	}
+
+	h.register <- client
+	return client
+}
+
+func (h *Hub) UnregisterClient(client *Client) {
+	h.unregister <- client
+}
+
+func (h *Hub) GetOnlineDevices(userID int64) []string {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	var devices []string
+	for deviceID, client := range h.clients {
+		if client.userID == userID {
+			devices = append(devices, deviceID)
+		}
+	}
+	return devices
+}
+
+func (h *Hub) IsDeviceOnline(deviceID string) bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	_, ok := h.clients[deviceID]
+	return ok
+}
+```
+
+---
+
+## КОД: internal/ws/client.go
+
+```go
+package ws
+
+import (
+	"encoding/json"
+	"log"
+	"time"
+
+	"github.com/gorilla/websocket"
+)
+
+func (c *Client) ReadPump() {
+	defer func() {
+		c.hub.UnregisterClient(c)
+		c.conn.Close()
+	}()
+
+	c.conn.SetReadLimit(maxMessageSize)
+	c.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+
+	c.conn.SetPongHandler(func(string) error {
+		c.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		return nil
+	})
+
+	for {
+		_, message, err := c.conn.ReadMessage()
+		if err != nil {
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+				log.Printf("WebSocket error: %v", err)
+			}
+			break
+		}
+
+		c.hub.db.UpdateDeviceLastSeen(c.deviceID)
+		c.handleMessage(message)
+	}
+}
+
+func (c *Client) WritePump() {
+	ticker := time.NewTicker(pingPeriod)
+	defer func() {
+		ticker.Stop()
+		c.conn.Close()
+	}()
+
+	for {
+		select {
+		case message, ok := <-c.send:
+			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if !ok {
+				c.conn.WriteMessage(websocket.CloseMessage, []byte{})
+				return
+			}
+
+			c.mu.Lock()
+			err := c.conn.WriteMessage(websocket.TextMessage, message)
+			c.mu.Unlock()
+
+			if err != nil {
+				return
+			}
+
+		case <-ticker.C:
+			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				return
+			}
+		}
+	}
+}
+
+func (c *Client) handleMessage(data []byte) {
+	var msg WSMessage
+	if err := json.Unmarshal(data, &msg); err != nil {
+		log.Printf("Invalid message format: %v", err)
+		c.sendError("invalid_format", "Invalid message format")
+		return
+	}
+
+	switch msg.Type {
+	case "send_message":
+		c.handleSendMessage(msg.Data)
+	case "sync":
+		c.handleSync(msg.Data)
+	case "ack":
+		c.handleAck(msg.Data)
+	case "read":
+		c.handleRead(msg.Data)
+	case "delete":
+		c.handleDelete(msg.Data)
+	case "ping":
+		c.handlePing()
+	default:
+		c.sendError("unknown_type", "Unknown message type: "+msg.Type)
+	}
+}
+
+func (c *Client) handleSendMessage(data json.RawMessage) {
+	var req struct {
+		RecipientID      int64  `json:"recipient_id"`
+		EncryptedContent []byte `json:"encrypted_content"`
+		ContentType      string `json:"content_type"`
+		FileID           string `json:"file_id,omitempty"`
+		ExpiresAt        int64  `json:"expires_at,omitempty"`
+	}
+
+	if err := json.Unmarshal(data, &req); err != nil {
+		c.sendError("invalid_data", "Invalid message data")
+		return
+	}
+
+	message, err := c.hub.db.CreateMessage(
+		c.userID,
+		req.RecipientID,
+		req.EncryptedContent,
+		req.ContentType,
+		req.FileID,
+		req.ExpiresAt,
+	)
+	if err != nil {
+		log.Printf("Error creating message: %v", err)
+		c.sendError("db_error", "Failed to save message")
+		return
+	}
+
+	c.sendJSON(map[string]interface{}{
+		"type": "message_sent",
+		"data": map[string]interface{}{
+			"seq_id":     message.SeqID,
+			"created_at": message.CreatedAt,
+		},
+	})
+
+	msgData, _ := json.Marshal(map[string]interface{}{
+		"type": "new_message",
+		"data": map[string]interface{}{
+			"seq_id":            message.SeqID,
+			"sender_id":         message.SenderID,
+			"encrypted_content": message.EncryptedContent,
+			"content_type":      message.ContentType,
+			"file_id":           message.FileID,
+			"created_at":        message.CreatedAt,
+			"expires_at":        message.ExpiresAt,
+		},
+	})
+
+	c.hub.SendToUser(req.RecipientID, msgData, "")
+	c.hub.SendToUser(c.userID, msgData, c.deviceID)
+
+	log.Printf("📨 Message sent: seq=%d from=%d to=%d", message.SeqID, c.userID, req.RecipientID)
+}
+
+func (c *Client) handleSync(data json.RawMessage) {
+	var req struct {
+		SinceSeqID int64 `json:"since_seq_id"`
+		Limit      int   `json:"limit,omitempty"`
+	}
+
+	if err := json.Unmarshal(data, &req); err != nil {
+		c.sendError("invalid_data", "Invalid sync request")
+		return
+	}
+
+	if req.Limit <= 0 || req.Limit > 100 {
+		req.Limit = 100
+	}
+
+	messages, err := c.hub.db.GetMessagesSince(c.userID, req.SinceSeqID, req.Limit)
+	if err != nil {
+		log.Printf("Error getting messages: %v", err)
+		c.sendError("db_error", "Failed to get messages")
+		return
+	}
+
+	if len(messages) > 0 {
+		lastSeq := messages[len(messages)-1].SeqID
+		c.hub.db.UpdateSyncCursor(c.deviceID, lastSeq)
+	}
+
+	c.sendJSON(map[string]interface{}{
+		"type": "sync_response",
+		"data": map[string]interface{}{
+			"messages":    messages,
+			"has_more":    len(messages) == req.Limit,
+			"server_time": time.Now().Unix(),
+		},
+	})
+}
+
+func (c *Client) handleAck(data json.RawMessage) {
+	var req struct {
+		SeqID int64 `json:"seq_id"`
+	}
+
+	if err := json.Unmarshal(data, &req); err != nil {
+		return
+	}
+
+	message, err := c.hub.db.GetMessageBySeqID(req.SeqID)
+	if err != nil || message == nil {
+		return
+	}
+
+	c.hub.db.SetMessageStatus(message.ID, c.deviceID, "delivered")
+
+	ackData, _ := json.Marshal(map[string]interface{}{
+		"type": "status_update",
+		"data": map[string]interface{}{
+			"seq_id":    req.SeqID,
+			"device_id": c.deviceID,
+			"status":    "delivered",
+		},
+	})
+	c.hub.SendToUser(message.SenderID, ackData, "")
+}
+
+func (c *Client) handleRead(data json.RawMessage) {
+	var req struct {
+		SeqID int64 `json:"seq_id"`
+	}
+
+	if err := json.Unmarshal(data, &req); err != nil {
+		return
+	}
+
+	message, err := c.hub.db.GetMessageBySeqID(req.SeqID)
+	if err != nil || message == nil {
+		return
+	}
+
+	c.hub.db.SetMessageStatus(message.ID, c.deviceID, "read")
+
+	readData, _ := json.Marshal(map[string]interface{}{
+		"type": "status_update",
+		"data": map[string]interface{}{
+			"seq_id":    req.SeqID,
+			"device_id": c.deviceID,
+			"status":    "read",
+		},
+	})
+	c.hub.SendToUser(message.SenderID, readData, "")
+}
+
+func (c *Client) handleDelete(data json.RawMessage) {
+	var req struct {
+		SeqID int64 `json:"seq_id"`
+	}
+
+	if err := json.Unmarshal(data, &req); err != nil {
+		return
+	}
+
+	message, err := c.hub.db.GetMessageBySeqID(req.SeqID)
+	if err != nil || message == nil {
+		return
+	}
+
+	if message.SenderID != c.userID {
+		c.sendError("forbidden", "Cannot delete other's messages")
+		return
+	}
+
+	if err := c.hub.db.DeleteMessage(req.SeqID); err != nil {
+		c.sendError("db_error", "Failed to delete message")
+		return
+	}
+
+	deleteData, _ := json.Marshal(map[string]interface{}{
+		"type": "message_deleted",
+		"data": map[string]interface{}{
+			"seq_id": req.SeqID,
+		},
+	})
+
+	c.hub.SendToUser(c.userID, deleteData, "")
+	c.hub.SendToUser(message.RecipientID, deleteData, "")
+
+	log.Printf("🗑️ Message deleted: seq=%d by=%d", req.SeqID, c.userID)
+}
+
+func (c *Client) handlePing() {
+	c.sendJSON(map[string]interface{}{
+		"type": "pong",
+		"data": map[string]interface{}{
+			"server_time": time.Now().Unix(),
+		},
+	})
+}
+
+func (c *Client) sendJSON(v interface{}) {
+	data, err := json.Marshal(v)
+	if err != nil {
+		return
+	}
+
+	select {
+	case c.send <- data:
+	default:
+	}
+}
+
+func (c *Client) sendError(code, message string) {
+	c.sendJSON(map[string]interface{}{
+		"type": "error",
+		"data": map[string]interface{}{
+			"code":    code,
+			"message": message,
+		},
+	})
+}
+```
+
+---
+
+## КОД: internal/db/db.go
+
+```go
+package db
+
+import (
+	"database/sql"
+	"fmt"
+	"os"
+	"path/filepath"
+	"time"
+
+	_ "modernc.org/sqlite"
+	"homelan-server/internal/models"
+)
+
+type Database struct {
+	conn *sql.DB
+}
+
+func New(dbPath string) (*Database, error) {
+	dir := filepath.Dir(dbPath)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return nil, fmt.Errorf("failed to create db directory: %w", err)
+	}
+
+	conn, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open database: %w", err)
+	}
+
+	if err := conn.Ping(); err != nil {
+		return nil, fmt.Errorf("failed to ping database: %w", err)
+	}
+
+	_, err = conn.Exec("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
+	if err != nil {
+		return nil, fmt.Errorf("failed to set pragmas: %w", err)
+	}
+
+	db := &Database{conn: conn}
+
+	if err := db.initSchema(); err != nil {
+		return nil, fmt.Errorf("failed to init schema: %w", err)
+	}
+
+	return db, nil
+}
+
+func (db *Database) Close() error {
+	return db.conn.Close()
+}
+
+func (db *Database) initSchema() error {
+	schema := `
+	CREATE TABLE IF NOT EXISTS users (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		username TEXT UNIQUE NOT NULL,
+		password_hash TEXT NOT NULL,
+		public_key BLOB,
+		created_at INTEGER NOT NULL,
+		last_seen INTEGER NOT NULL,
+		is_admin INTEGER DEFAULT 0
+	);
+
+	CREATE TABLE IF NOT EXISTS devices (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		user_id INTEGER NOT NULL,
+		device_id TEXT UNIQUE NOT NULL,
+		device_name TEXT NOT NULL,
+		device_type TEXT NOT NULL,
+		public_key BLOB,
+		created_at INTEGER NOT NULL,
+		last_seen INTEGER NOT NULL,
+		is_revoked INTEGER DEFAULT 0,
+		FOREIGN KEY (user_id) REFERENCES users(id)
+	);
+
+	CREATE TABLE IF NOT EXISTS messages (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		seq_id INTEGER UNIQUE NOT NULL,
+		sender_id INTEGER NOT NULL,
+		recipient_id INTEGER NOT NULL,
+		encrypted_content BLOB NOT NULL,
+		content_type TEXT NOT NULL,
+		file_id TEXT,
+		created_at INTEGER NOT NULL,
+		expires_at INTEGER,
+		is_deleted INTEGER DEFAULT 0,
+		deleted_at INTEGER,
+		FOREIGN KEY (sender_id) REFERENCES users(id),
+		FOREIGN KEY (recipient_id) REFERENCES users(id)
+	);
+
+	CREATE TABLE IF NOT EXISTS message_status (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		message_id INTEGER NOT NULL,
+		device_id TEXT NOT NULL,
+		status TEXT NOT NULL,
+		updated_at INTEGER NOT NULL,
+		FOREIGN KEY (message_id) REFERENCES messages(id),
+		UNIQUE(message_id, device_id)
+	);
+
+	CREATE TABLE IF NOT EXISTS files (
+		id TEXT PRIMARY KEY,
+		uploader_id INTEGER NOT NULL,
+		file_name_encrypted BLOB NOT NULL,
+		file_size INTEGER NOT NULL,
+		mime_type TEXT,
+		storage_path TEXT NOT NULL,
+		created_at INTEGER NOT NULL,
+		expires_at INTEGER,
+		is_deleted INTEGER DEFAULT 0,
+		FOREIGN KEY (uploader_id) REFERENCES users(id)
+	);
+
+	CREATE TABLE IF NOT EXISTS sync_cursors (
+		device_id TEXT PRIMARY KEY,
+		last_seq_id INTEGER NOT NULL DEFAULT 0,
+		updated_at INTEGER NOT NULL
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_messages_seq ON messages(seq_id);
+	CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages(sender_id);
+	CREATE INDEX IF NOT EXISTS idx_messages_recipient ON messages(recipient_id);
+	CREATE INDEX IF NOT EXISTS idx_devices_user ON devices(user_id);
+	`
+
+	_, err := db.conn.Exec(schema)
+	return err
+}
+
+// ============ USER METHODS ============
+
+func (db *Database) CreateUser(username, passwordHash string, isAdmin bool) (*models.User, error) {
+	now := time.Now().Unix()
+	adminInt := 0
+	if isAdmin {
+		adminInt = 1
+	}
+
+	result, err := db.conn.Exec(
+		`INSERT INTO users (username, password_hash, created_at, last_seen, is_admin) 
+		 VALUES (?, ?, ?, ?, ?)`,
+		username, passwordHash, now, now, adminInt,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	id, _ := result.LastInsertId()
+	return &models.User{
+		ID:           id,
+		Username:     username,
+		PasswordHash: passwordHash,
+		CreatedAt:    now,
+		LastSeen:     now,
+		IsAdmin:      isAdmin,
+	}, nil
+}
+
+func (db *Database) GetUserByUsername(username string) (*models.User, error) {
+	var user models.User
+	var isAdmin int
+	var publicKey []byte
+
+	err := db.conn.QueryRow(
+		`SELECT id, username, password_hash, public_key, created_at, last_seen, is_admin 
+		 FROM users WHERE username = ?`,
+		username,
+	).Scan(&user.ID, &user.Username, &user.PasswordHash, &publicKey,
+		&user.CreatedAt, &user.LastSeen, &isAdmin)
+
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	user.PublicKey = publicKey
+	user.IsAdmin = isAdmin == 1
+	return &user, nil
+}
+
+func (db *Database) GetUserByID(id int64) (*models.User, error) {
+	var user models.User
+	var isAdmin int
+	var publicKey []byte
+
+	err := db.conn.QueryRow(
+		`SELECT id, username, password_hash, public_key, created_at, last_seen, is_admin 
+		 FROM users WHERE id = ?`,
+		id,
+	).Scan(&user.ID, &user.Username, &user.PasswordHash, &publicKey,
+		&user.CreatedAt, &user.LastSeen, &isAdmin)
+
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	user.PublicKey = publicKey
+	user.IsAdmin = isAdmin == 1
+	return &user, nil
+}
+
+func (db *Database) UpdateUserLastSeen(userID int64) error {
+	_, err := db.conn.Exec(
+		`UPDATE users SET last_seen = ? WHERE id = ?`,
+		time.Now().Unix(), userID,
+	)
+	return err
+}
+
+func (db *Database) UpdateUserPublicKey(userID int64, publicKey []byte) error {
+	_, err := db.conn.Exec(
+		`UPDATE users SET public_key = ? WHERE id = ?`,
+		publicKey, userID,
+	)
+	return err
+}
+
+func (db *Database) GetAdmin() (*models.User, error) {
+	var user models.User
+	var isAdmin int
+	var publicKey []byte
+
+	err := db.conn.QueryRow(
+		`SELECT id, username, password_hash, public_key, created_at, last_seen, is_admin 
+		 FROM users WHERE is_admin = 1 LIMIT 1`,
+	).Scan(&user.ID, &user.Username, &user.PasswordHash, &publicKey,
+		&user.CreatedAt, &user.LastSeen, &isAdmin)
+
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	user.PublicKey = publicKey
+	user.IsAdmin = true
+	return &user, nil
+}
+
+// ============ DEVICE METHODS ============
+
+func (db *Database) CreateDevice(userID int64, deviceID, deviceName, deviceType string, publicKey []byte) (*models.Device, error) {
+	now := time.Now().Unix()
+
+	if publicKey == nil {
+		publicKey = []byte{}
+	}
+
+	result, err := db.conn.Exec(
+		`INSERT INTO devices (user_id, device_id, device_name, device_type, public_key, created_at, last_seen, is_revoked)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, 0)`,
+		userID, deviceID, deviceName, deviceType, publicKey, now, now,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	id, _ := result.LastInsertId()
+	return &models.Device{
+		ID:         id,
+		UserID:     userID,
+		DeviceID:   deviceID,
+		DeviceName: deviceName,
+		DeviceType: deviceType,
+		PublicKey:  publicKey,
+		CreatedAt:  now,
+		LastSeen:   now,
+		IsRevoked:  false,
+	}, nil
+}
+
+func (db *Database) GetDeviceByID(deviceID string) (*models.Device, error) {
+	var device models.Device
+	var isRevoked int
+
+	err := db.conn.QueryRow(
+		`SELECT id, user_id, device_id, device_name, device_type, public_key, created_at, last_seen, is_revoked
+		 FROM devices WHERE device_id = ?`,
+		deviceID,
+	).Scan(&device.ID, &device.UserID, &device.DeviceID, &device.DeviceName,
+		&device.DeviceType, &device.PublicKey, &device.CreatedAt, &device.LastSeen, &isRevoked)
+
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	device.IsRevoked = isRevoked == 1
+	return &device, nil
+}
+
+func (db *Database) GetUserDevices(userID int64) ([]*models.Device, error) {
+	rows, err := db.conn.Query(
+		`SELECT id, user_id, device_id, device_name, device_type, public_key, created_at, last_seen, is_revoked
+		 FROM devices WHERE user_id = ? AND is_revoked = 0`,
+		userID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var devices []*models.Device
+	for rows.Next() {
+		var d models.Device
+		var isRevoked int
+		err := rows.Scan(&d.ID, &d.UserID, &d.DeviceID, &d.DeviceName,
+			&d.DeviceType, &d.PublicKey, &d.CreatedAt, &d.LastSeen, &isRevoked)
+		if err != nil {
+			return nil, err
+		}
+		d.IsRevoked = isRevoked == 1
+		devices = append(devices, &d)
+	}
+
+	return devices, nil
+}
+
+func (db *Database) UpdateDeviceLastSeen(deviceID string) error {
+	_, err := db.conn.Exec(
+		`UPDATE devices SET last_seen = ? WHERE device_id = ?`,
+		time.Now().Unix(), deviceID,
+	)
+	return err
+}
+
+func (db *Database) RevokeDevice(deviceID string) error {
+	_, err := db.conn.Exec(
+		`UPDATE devices SET is_revoked = 1 WHERE device_id = ?`,
+		deviceID,
+	)
+	return err
+}
+
+// ============ MESSAGE METHODS ============
+
+func (db *Database) GetNextSeqID() (int64, error) {
+	var maxSeq sql.NullInt64
+	err := db.conn.QueryRow(`SELECT MAX(seq_id) FROM messages`).Scan(&maxSeq)
+	if err != nil {
+		return 0, err
+	}
+	if !maxSeq.Valid {
+		return 1, nil
+	}
+	return maxSeq.Int64 + 1, nil
+}
+
+func (db *Database) CreateMessage(senderID, recipientID int64, encryptedContent []byte, contentType string, fileID string, expiresAt int64) (*models.Message, error) {
+	seqID, err := db.GetNextSeqID()
+	if err != nil {
+		return nil, err
+	}
+
+	now := time.Now().Unix()
+
+	var fileIDPtr interface{}
+	if fileID != "" {
+		fileIDPtr = fileID
+	}
+
+	var expiresAtPtr interface{}
+	if expiresAt > 0 {
+		expiresAtPtr = expiresAt
+	}
+
+	result, err := db.conn.Exec(
+		`INSERT INTO messages (seq_id, sender_id, recipient_id, encrypted_content, content_type, file_id, created_at, expires_at, is_deleted)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)`,
+		seqID, senderID, recipientID, encryptedContent, contentType, fileIDPtr, now, expiresAtPtr,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	id, _ := result.LastInsertId()
+	return &models.Message{
+		ID:               id,
+		SeqID:            seqID,
+		SenderID:         senderID,
+		RecipientID:      recipientID,
+		EncryptedContent: encryptedContent,
+		ContentType:      contentType,
+		FileID:           fileID,
+		CreatedAt:        now,
+		ExpiresAt:        expiresAt,
+	}, nil
+}
+
+func (db *Database) GetMessagesSince(userID int64, sinceSeqID int64, limit int) ([]*models.Message, error) {
+	rows, err := db.conn.Query(
+		`SELECT id, seq_id, sender_id, recipient_id, encrypted_content, content_type, file_id, created_at, expires_at, is_deleted, deleted_at
+		 FROM messages 
+		 WHERE (sender_id = ? OR recipient_id = ?) AND seq_id > ?
+		 ORDER BY seq_id ASC
+		 LIMIT ?`,
+		userID, userID, sinceSeqID, limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var messages []*models.Message
+	for rows.Next() {
+		var m models.Message
+		var fileID sql.NullString
+		var expiresAt, deletedAt sql.NullInt64
+		var isDeleted int
+
+		err := rows.Scan(&m.ID, &m.SeqID, &m.SenderID, &m.RecipientID,
+			&m.EncryptedContent, &m.ContentType, &fileID, &m.CreatedAt,
+			&expiresAt, &isDeleted, &deletedAt)
+		if err != nil {
+			return nil, err
+		}
+
+		if fileID.Valid {
+			m.FileID = fileID.String
+		}
+		if expiresAt.Valid {
+			m.ExpiresAt = expiresAt.Int64
+		}
+		if deletedAt.Valid {
+			m.DeletedAt = deletedAt.Int64
+		}
+		m.IsDeleted = isDeleted == 1
+
+		messages = append(messages, &m)
+	}
+
+	return messages, nil
+}
+
+func (db *Database) GetMessageBySeqID(seqID int64) (*models.Message, error) {
+	var m models.Message
+	var fileID sql.NullString
+	var expiresAt, deletedAt sql.NullInt64
+	var isDeleted int
+
+	err := db.conn.QueryRow(
+		`SELECT id, seq_id, sender_id, recipient_id, encrypted_content, content_type, file_id, created_at, expires_at, is_deleted, deleted_at
+		 FROM messages WHERE seq_id = ?`,
+		seqID,
+	).Scan(&m.ID, &m.SeqID, &m.SenderID, &m.RecipientID,
+		&m.EncryptedContent, &m.ContentType, &fileID, &m.CreatedAt,
+		&expiresAt, &isDeleted, &deletedAt)
+
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	if fileID.Valid {
+		m.FileID = fileID.String
+	}
+	if expiresAt.Valid {
+		m.ExpiresAt = expiresAt.Int64
+	}
+	if deletedAt.Valid {
+		m.DeletedAt = deletedAt.Int64
+	}
+	m.IsDeleted = isDeleted == 1
+
+	return &m, nil
+}
+
+func (db *Database) DeleteMessage(seqID int64) error {
+	now := time.Now().Unix()
+	_, err := db.conn.Exec(
+		`UPDATE messages SET is_deleted = 1, deleted_at = ?, encrypted_content = X'' WHERE seq_id = ?`,
+		now, seqID,
+	)
+	return err
+}
+
+func (db *Database) DeleteExpiredMessages() (int64, error) {
+	now := time.Now().Unix()
+	result, err := db.conn.Exec(
+		`UPDATE messages SET is_deleted = 1, deleted_at = ?, encrypted_content = X'' 
+		 WHERE expires_at IS NOT NULL AND expires_at < ? AND is_deleted = 0`,
+		now, now,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+// ============ MESSAGE STATUS METHODS ============
+
+func (db *Database) SetMessageStatus(messageID int64, deviceID string, status string) error {
+	now := time.Now().Unix()
+	_, err := db.conn.Exec(
+		`INSERT INTO message_status (message_id, device_id, status, updated_at)
+		 VALUES (?, ?, ?, ?)
+		 ON CONFLICT(message_id, device_id) DO UPDATE SET status = ?, updated_at = ?`,
+		messageID, deviceID, status, now, status, now,
+	)
+	return err
+}
+
+func (db *Database) GetMessageStatus(messageID int64, deviceID string) (string, error) {
+	var status string
+	err := db.conn.QueryRow(
+		`SELECT status FROM message_status WHERE message_id = ? AND device_id = ?`,
+		messageID, deviceID,
+	).Scan(&status)
+
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	return status, err
+}
+
+// ============ SYNC CURSOR METHODS ============
+
+func (db *Database) GetSyncCursor(deviceID string) (int64, error) {
+	var lastSeqID int64
+	err := db.conn.QueryRow(
+		`SELECT last_seq_id FROM sync_cursors WHERE device_id = ?`,
+		deviceID,
+	).Scan(&lastSeqID)
+
+	if err == sql.ErrNoRows {
+		return 0, nil
+	}
+	return lastSeqID, err
+}
+
+func (db *Database) UpdateSyncCursor(deviceID string, lastSeqID int64) error {
+	now := time.Now().Unix()
+	_, err := db.conn.Exec(
+		`INSERT INTO sync_cursors (device_id, last_seq_id, updated_at)
+		 VALUES (?, ?, ?)
+		 ON CONFLICT(device_id) DO UPDATE SET last_seq_id = ?, updated_at = ?`,
+		deviceID, lastSeqID, now, lastSeqID, now,
+	)
+	return err
+}
+```
+
+---
+
+## Что дальше
+
+```
+ВАРИАНТЫ:
+A) Начать Flutter клиент (UI для Android/Windows)
+B) Добавить файлы (HTTP upload/download)
+C) Добавить безопасность (Panic, Dead Man's Switch)
+```
+
+---
+
+**Скопируй весь этот текст и сохрани** — с ним можно продолжить в любом чате! 📋

@@ -1,0 +1,51 @@
+Привет! Я начинаю разработку проекта HomeLAN Messenger (v2.3).
+Это приватный мессенджер для домашней локальной сети (LAN) на Go + Flutter.
+
+Вот полная утвержденная архитектура и техническое задание.
+Изучи её внимательно, ничего менять в архитектуре не нужно.
+Далее мы будем писать код по этапам.
+
+# АРХИТЕКТУРА HOMELAN MESSENGER v2.3 (FINAL)
+
+## 1. Обзор
+Пользователи: 2 человека, 4 устройства (Windows + Android).
+Сервер: Orange Pi Zero 3 (2GB RAM), LAN, Go.
+Клиенты: Flutter (Android/Windows).
+Сеть: WebSocket (сигналы/чат) + HTTP (файлы).
+
+## 2. Ключевые требования
+- E2E шифрование: XChaCha20-Poly1305 + X25519.
+- Device Linking: 2-QR ephemeral exchange + Text Fallback (для ПК без камеры).
+- Хранение: SQLite + SQLCipher (клиент), SQLite (сервер).
+- Sync: по seq_id + Tombstones (удаление).
+- Файлы: Streaming io.Copy (без OOM), LimitReader, проверка места.
+- Безопасность: USB Key, Panic Script (wipe WAL+header), Dead Man's Switch (check year >= 2024).
+- Time Sync: Клиент считает Delta от server_time.
+
+## 3. Стек
+SERVER (Go 1.21+):
+- gorilla/websocket, net/http (Timeouts 5min/60s).
+- sqlite + WAL mode.
+- fsnotify (USB), systemd.
+- Panic: rm WAL/SHM -> dd header.
+
+CLIENT (Flutter 3.16+):
+- drift + sqlcipher.
+- flutter_sodium (libsodium).
+- Foreground Service, WebSockets (reconnect backoff).
+
+## 4. Протокол данных
+- Identity Key: Генерируется 1 раз, хранится в Secure Storage/USB.
+- Сообщения: seq_id (int), encrypted_payload (blob), nonce.
+- Файлы: Upload/Download по токену, Range headers.
+
+## 5. Модель угроз (Принятые риски)
+- SD Wear Leveling: Secure delete на SD не гарантирован (Accept Risk для v1).
+- Metadata: Сервер видит кто-кому пишет (Accept Risk, сервер свой).
+- Windows Camera: Если нет камеры, используется ручной ввод base64 (Text Fallback).
+
+---
+
+ДАВАЙ НАЧНЕМ С СЕРВЕРА (Go).
+Этап 1: Базовая структура проекта, подключение SQLite и настройка логгера.
+Создай структуру папок и файл `internal/db/db.go` с инициализацией SQLite (включи WAL mode).
