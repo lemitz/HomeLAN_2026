@@ -10,6 +10,7 @@ import (
 	"time"
 
 	_ "github.com/mutecomm/go-sqlcipher/v4"
+	"golang.org/x/crypto/bcrypt"
 	"homelan-server/internal/models"
 )
 
@@ -146,10 +147,22 @@ func (db *Database) initSchema() error {
 		updated_at INTEGER NOT NULL
 	);
 
+	CREATE TABLE IF NOT EXISTS sessions (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		token_hash TEXT UNIQUE NOT NULL,
+		user_id INTEGER NOT NULL,
+		device_id TEXT NOT NULL,
+		created_at INTEGER NOT NULL,
+		expires_at INTEGER NOT NULL,
+		is_revoked INTEGER DEFAULT 0,
+		FOREIGN KEY (user_id) REFERENCES users(id)
+	);
+
 	CREATE INDEX IF NOT EXISTS idx_messages_seq ON messages(seq_id);
 	CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages(sender_id);
 	CREATE INDEX IF NOT EXISTS idx_messages_recipient ON messages(recipient_id);
 	CREATE INDEX IF NOT EXISTS idx_devices_user ON devices(user_id);
+	CREATE INDEX IF NOT EXISTS idx_sessions_token ON sessions(token_hash);
 	`
 
 	_, err := db.conn.Exec(schema)
@@ -158,12 +171,18 @@ func (db *Database) initSchema() error {
 
 // ============ USER METHODS ============
 
-func (db *Database) CreateUser(username, passwordHash string, isAdmin bool) (*models.User, error) {
+func (db *Database) CreateUser(username, password string, isAdmin bool) (*models.User, error) {
 	now := time.Now().Unix()
 	adminInt := 0
 	if isAdmin {
 		adminInt = 1
 	}
+
+	hashedBytes, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		return nil, fmt.Errorf("failed to hash password: %w", err)
+	}
+	passwordHash := string(hashedBytes)
 
 	result, err := db.conn.Exec(
 		`INSERT INTO users (username, password_hash, created_at, last_seen, is_admin) 
@@ -803,4 +822,74 @@ func (db *Database) GetAllUsers() ([]*models.User, error) {
 	}
 
 	return users, nil
+}
+
+func (db *Database) UpdateUserPassword(userID int64, passwordHash string) error {
+	_, err := db.conn.Exec(
+		`UPDATE users SET password_hash = ? WHERE id = ?`,
+		passwordHash, userID,
+	)
+	return err
+}
+
+func (db *Database) CreateSession(userID int64, deviceID, tokenHash string, duration time.Duration) (*models.Session, error) {
+	now := time.Now().Unix()
+	expiresAt := now + int64(duration.Seconds())
+
+	result, err := db.conn.Exec(
+		`INSERT INTO sessions (token_hash, user_id, device_id, created_at, expires_at, is_revoked)
+		 VALUES (?, ?, ?, ?, ?, 0)`,
+		tokenHash, userID, deviceID, now, expiresAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	id, _ := result.LastInsertId()
+	return &models.Session{
+		ID:        id,
+		TokenHash: tokenHash,
+		UserID:    userID,
+		DeviceID:  deviceID,
+		CreatedAt: now,
+		ExpiresAt: expiresAt,
+		IsRevoked: false,
+	}, nil
+}
+
+func (db *Database) GetSessionByTokenHash(tokenHash string) (*models.Session, error) {
+	var s models.Session
+	var isRevoked int
+
+	err := db.conn.QueryRow(
+		`SELECT id, token_hash, user_id, device_id, created_at, expires_at, is_revoked
+		 FROM sessions WHERE token_hash = ?`,
+		tokenHash,
+	).Scan(&s.ID, &s.TokenHash, &s.UserID, &s.DeviceID, &s.CreatedAt, &s.ExpiresAt, &isRevoked)
+
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	s.IsRevoked = isRevoked == 1
+	return &s, nil
+}
+
+func (db *Database) RevokeSession(tokenHash string) error {
+	_, err := db.conn.Exec(
+		`UPDATE sessions SET is_revoked = 1 WHERE token_hash = ?`,
+		tokenHash,
+	)
+	return err
+}
+
+func (db *Database) RevokeAllUserSessions(userID int64) error {
+	_, err := db.conn.Exec(
+		`UPDATE sessions SET is_revoked = 1 WHERE user_id = ?`,
+		userID,
+	)
+	return err
 }

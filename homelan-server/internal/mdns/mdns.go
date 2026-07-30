@@ -39,13 +39,13 @@ func New(port int) (*MDNSServer, error) {
 	log.Printf("📡 mDNS: Advertising service '_homelan._tcp' on IPs: %v", ips)
 
 	service, err := mdns.NewMDNSService(
-		hostname,           // Instance Name (например "orange-pi")
-		"_homelan._tcp",    // Service Type (важно для поиска)
-		"",                 // Domain (local)
-		"",                 // Hostname
-		port,               // Port
-		ips,                // IPs
-		[]string{           // TXT records info
+		hostname,        // Instance Name (например "orange-pi")
+		"_homelan._tcp", // Service Type (важно для поиска)
+		"",              // Domain (local)
+		"",              // Hostname
+		port,            // Port
+		ips,             // IPs
+		[]string{ // TXT records info
 			"version=0.7.0",
 			"name=HomeLAN Server",
 		},

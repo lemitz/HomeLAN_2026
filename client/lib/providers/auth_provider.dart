@@ -52,6 +52,8 @@ class AuthProvider with ChangeNotifier {
     await _crypto.init();
     await ForegroundService().init();
     
+    _api.token = await _crypto.getSessionToken();
+    
     final prefs = await SharedPreferences.getInstance();
     _userId = prefs.getInt('user_id');
     _username = prefs.getString('username');
@@ -148,6 +150,12 @@ class AuthProvider with ChangeNotifier {
       _username = username;
       _isAdmin = result['is_admin'] ?? false;
 
+      final token = result['token'] as String?;
+      if (token != null) {
+        await _crypto.saveSessionToken(token);
+        _api.token = token;
+      }
+
       await _saveSession();
       await _connectWebSocket();
       await _refreshPartner();
@@ -183,6 +191,12 @@ class AuthProvider with ChangeNotifier {
       _username = username;
       _isAdmin = result['is_admin'] ?? false;
       
+      final token = result['token'] as String?;
+      if (token != null) {
+        await _crypto.saveSessionToken(token);
+        _api.token = token;
+      }
+
       // Партнёр приходит сразу с логина
       if (result['partner_id'] != null && result['partner_id'] > 0) {
         _partnerId = result['partner_id'];
@@ -218,12 +232,18 @@ class AuthProvider with ChangeNotifier {
     required int userId,
     required String username,
     required String deviceId,
+    String? token,
   }) async {
     _userId = userId;
     _username = username;
     _deviceId = deviceId;
     _sessionInvalid = false;
     
+    if (token != null) {
+      await _crypto.saveSessionToken(token);
+      _api.token = token;
+    }
+
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString('device_id', deviceId);
     
@@ -231,7 +251,7 @@ class AuthProvider with ChangeNotifier {
     await _connectWebSocket();
     await _refreshPartner();
     
-    print('✅ Device linked successfully: $username (ID: $userId)');
+    print('🔐 Device linked successfully: $username (ID: $userId)');
     notifyListeners();
   }
 
@@ -247,6 +267,7 @@ class AuthProvider with ChangeNotifier {
     await prefs.remove('partner_username');
 
     await _crypto.clearKeys();
+    _api.token = null;
 
     _userId = null;
     _username = null;
@@ -273,6 +294,7 @@ class AuthProvider with ChangeNotifier {
 
     await _crypto.clearKeys();
     await _db.clearAll();
+    _api.token = null;
 
     _userId = null;
     _username = null;
@@ -301,10 +323,11 @@ class AuthProvider with ChangeNotifier {
 
   Future<void> _connectWebSocket() async {
     if (_userId != null && _deviceId != null) {
+      final token = await _crypto.getSessionToken() ?? 'temp_token';
       await _ws.connect(
         userId: _userId!,
         deviceId: _deviceId!,
-        token: 'temp_token',
+        token: token,
       );
       await ForegroundService().start();
     }

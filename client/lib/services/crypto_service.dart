@@ -3,10 +3,16 @@ import 'dart:typed_data';
 import 'package:flutter/foundation.dart';
 import 'package:cryptography/cryptography.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
 class CryptoService {
   static const String _privateKeyKey = 'private_key';
   static const String _publicKeyKey = 'public_key';
+  static const String _sessionTokenKey = 'session_token';
+  
+  final _secureStorage = const FlutterSecureStorage(
+    aOptions: AndroidOptions(encryptedSharedPreferences: true),
+  );
   
   final X25519 _keyExchange = X25519();
   final Chacha20 _cipher = Chacha20.poly1305Aead();
@@ -16,9 +22,27 @@ class CryptoService {
 
   /// Инициализация — загружаем или генерируем ключи
   Future<void> init() async {
-    final prefs = await SharedPreferences.getInstance();
-    final privateKeyBase64 = prefs.getString(_privateKeyKey);
-    final publicKeyBase64 = prefs.getString(_publicKeyKey);
+    // 1. Try reading from SecureStorage
+    String? privateKeyBase64 = await _secureStorage.read(key: _privateKeyKey);
+    String? publicKeyBase64 = await _secureStorage.read(key: _publicKeyKey);
+
+    // 2. Migration from SharedPreferences if not in SecureStorage
+    if (privateKeyBase64 == null) {
+      final prefs = await SharedPreferences.getInstance();
+      privateKeyBase64 = prefs.getString(_privateKeyKey);
+      publicKeyBase64 = prefs.getString(_publicKeyKey);
+
+      if (privateKeyBase64 != null && publicKeyBase64 != null) {
+        // Save to SecureStorage
+        await _secureStorage.write(key: _privateKeyKey, value: privateKeyBase64);
+        await _secureStorage.write(key: _publicKeyKey, value: publicKeyBase64);
+        
+        // Remove from SharedPreferences
+        await prefs.remove(_privateKeyKey);
+        await prefs.remove(_publicKeyKey);
+        print('🔐 Migrated key pair to secure storage and deleted from SharedPreferences');
+      }
+    }
 
     if (privateKeyBase64 != null && publicKeyBase64 != null) {
       final privateKeyBytes = base64Decode(privateKeyBase64);
@@ -29,7 +53,7 @@ class CryptoService {
         publicKey: SimplePublicKey(publicKeyBytes, type: KeyPairType.x25519),
         type: KeyPairType.x25519,
       );
-      print('🔐 Loaded existing key pair');
+      print('🔐 Loaded existing key pair from secure storage');
     } else {
       await generateKeyPair();
     }
@@ -45,11 +69,18 @@ class CryptoService {
       type: KeyPairType.x25519,
     );
     
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(_privateKeyKey, base64Encode(keyData['private']!));
-    await prefs.setString(_publicKeyKey, base64Encode(keyData['public']!));
+    final privateKeyBase64 = base64Encode(keyData['private']!);
+    final publicKeyBase64 = base64Encode(keyData['public']!);
+
+    await _secureStorage.write(key: _privateKeyKey, value: privateKeyBase64);
+    await _secureStorage.write(key: _publicKeyKey, value: publicKeyBase64);
     
-    print('🔐 Generated new key pair');
+    // Ensure we delete any legacy keys in shared preferences
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove(_privateKeyKey);
+    await prefs.remove(_publicKeyKey);
+
+    print('🔐 Generated and saved new key pair in secure storage');
   }
 
   static Future<Map<String, Uint8List>> _generateKeyPairIsolate(void _) async {
@@ -110,12 +141,16 @@ class CryptoService {
         type: KeyPairType.x25519,
       );
       
-      // Сохраняем импортированные ключи
-      final prefs = await SharedPreferences.getInstance();
-      await prefs.setString(_privateKeyKey, data['private'] as String);
-      await prefs.setString(_publicKeyKey, data['public'] as String);
+      // Сохраняем импортированные ключи в SecureStorage
+      await _secureStorage.write(key: _privateKeyKey, value: data['private'] as String);
+      await _secureStorage.write(key: _publicKeyKey, value: data['public'] as String);
       
-      print('🔐 Imported key pair successfully');
+      // Удаляем из SharedPreferences на всякий случай
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.remove(_privateKeyKey);
+      await prefs.remove(_publicKeyKey);
+      
+      print('🔐 Imported key pair successfully into secure storage');
     } catch (e) {
       print('🔐 Failed to import key pair: $e');
       rethrow;
@@ -124,8 +159,40 @@ class CryptoService {
 
   /// Проверяет, есть ли ключи
   Future<bool> hasKeys() async {
+    String? privateKey = await _secureStorage.read(key: _privateKeyKey);
+    if (privateKey != null) return true;
+
     final prefs = await SharedPreferences.getInstance();
     return prefs.getString(_privateKeyKey) != null;
+  }
+
+  // ============ СЕССИОННЫЕ ТОКЕНЫ ============
+
+  Future<void> saveSessionToken(String token) async {
+    await _secureStorage.write(key: _sessionTokenKey, value: token);
+  }
+
+  Future<String?> getSessionToken() async {
+    // Check secure storage first
+    String? token = await _secureStorage.read(key: _sessionTokenKey);
+    if (token != null) return token;
+
+    // Check SharedPreferences for migration
+    final prefs = await SharedPreferences.getInstance();
+    token = prefs.getString(_sessionTokenKey);
+    if (token != null) {
+      // Migrate to secure storage
+      await _secureStorage.write(key: _sessionTokenKey, value: token);
+      await prefs.remove(_sessionTokenKey);
+      print('🔐 Migrated session token to secure storage');
+    }
+    return token;
+  }
+
+  Future<void> clearSessionToken() async {
+    await _secureStorage.delete(key: _sessionTokenKey);
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove(_sessionTokenKey);
   }
 
   // ============ ПУБЛИЧНЫЕ КЛЮЧИ ДРУГИХ ЮЗЕРОВ ============
@@ -224,11 +291,16 @@ class CryptoService {
   }
 
   Future<void> clearKeys() async {
+    await _secureStorage.delete(key: _privateKeyKey);
+    await _secureStorage.delete(key: _publicKeyKey);
+    await clearSessionToken();
+    
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove(_privateKeyKey);
     await prefs.remove(_publicKeyKey);
+    
     _keyPair = null;
     _publicKeys.clear();
-    print('🔐 Cleared all keys');
+    print('🔐 Cleared all keys from secure storage and preferences');
   }
 }

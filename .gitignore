@@ -1,0 +1,42 @@
+# HomeLAN Repository Git Ignore File
+
+# Server database and data directories
+homelan-server/data/
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# Build outputs & Binaries
+homelan-server/homelan-server-*
+homelan-server/homelan-server.exe
+*.exe
+*.dll
+*.so
+*.dylib
+bin/
+
+# Keys and configs with secrets
+keys/
+configs/
+*master.key
+master.key
+config_local.yaml
+
+# IDE & OS files
+.idea/
+.vscode/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.swp
+.DS_Store
+Thumbs.db
+
+# Flutter/Dart build and client files
+client/.dart_tool/
+client/.flutter-plugins
+client/.flutter-plugins-dependencies
+client/build/
+client/pubspec.lock
