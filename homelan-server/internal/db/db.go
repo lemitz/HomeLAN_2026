@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	_ "github.com/mutecomm/go-sqlcipher/v4"
@@ -14,6 +15,7 @@ import (
 
 type Database struct {
 	conn *sql.DB
+	mu   sync.Mutex
 }
 
 // New открывает зашифрованную БД
@@ -415,6 +417,9 @@ func (db *Database) GetNextSeqID() (int64, error) {
 }
 
 func (db *Database) CreateMessage(senderID, recipientID int64, encryptedContent []byte, contentType string, fileID string, expiresAt int64) (*models.Message, error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
 	seqID, err := db.GetNextSeqID()
 	if err != nil {
 		return nil, err

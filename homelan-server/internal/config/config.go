@@ -31,7 +31,8 @@ type FilesConfig struct {
 }
 
 type SecurityConfig struct {
-	MaxUsers int `yaml:"max_users"`
+	MaxUsers       int    `yaml:"max_users"`
+	DuressPassword string `yaml:"duress_password"`
 }
 
 type TimeoutConfig struct {

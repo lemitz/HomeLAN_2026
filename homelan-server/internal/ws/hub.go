@@ -71,13 +71,16 @@ func (h *Hub) Run() {
 		select {
 		case client := <-h.register:
 			h.mu.Lock()
+			if existing, ok := h.clients[client.deviceID]; ok && existing != client {
+				close(existing.send)
+			}
 			h.clients[client.deviceID] = client
 			h.mu.Unlock()
 			log.Printf("📱 Client connected: device=%s user=%d", client.deviceID, client.userID)
 
 		case client := <-h.unregister:
 			h.mu.Lock()
-			if _, ok := h.clients[client.deviceID]; ok {
+			if existing, ok := h.clients[client.deviceID]; ok && existing == client {
 				delete(h.clients, client.deviceID)
 				close(client.send)
 			}

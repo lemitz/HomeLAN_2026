@@ -114,6 +114,17 @@ func (c *Client) handleSendMessage(data json.RawMessage) {
 		return
 	}
 
+	if req.RecipientID == 0 || req.RecipientID == c.userID {
+		c.sendError("invalid_recipient", "Invalid recipient ID")
+		return
+	}
+
+	recipient, err := c.hub.db.GetUserByID(req.RecipientID)
+	if err != nil || recipient == nil {
+		c.sendError("user_not_found", "Recipient user not found")
+		return
+	}
+
 	message, err := c.hub.db.CreateMessage(
 		c.userID,
 		req.RecipientID,
@@ -190,9 +201,8 @@ func (c *Client) handleSync(data json.RawMessage) {
 		return
 	}
 
-	if len(messages) > 0 {
-		// Обновляем курсор только если это новые сообщения (обычно), 
-		// но оставим логику как есть для простоты, если это не ломает flow
+	if len(messages) > 0 && req.BeforeSeqID == 0 {
+		// Обновляем курсор только при запросе новых сообщений вперёд
 		lastSeq := messages[len(messages)-1].SeqID
 		c.hub.db.UpdateSyncCursor(c.deviceID, lastSeq)
 	}
