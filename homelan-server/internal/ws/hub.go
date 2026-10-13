@@ -17,18 +17,70 @@ const (
 	// Время между пингами
 	pingPeriod = 30 * time.Second
 
+	// Таймаут чтения (должен быть больше pingPeriod)
+	pongWait = 60 * time.Second
+
 	// Максимальный размер сообщения (1MB)
 	maxMessageSize = 1024 * 1024
+
+	// Как часто обновлять last_seen при активности (чтобы не писать в БД на каждое сообщение)
+	lastSeenUpdateInterval = 30 * time.Second
 )
 
-// Client - подключённый клиент
+// Client - подключённый клиент.
+//
+// Канал send никогда не закрывается извне: закрытие канала, в который пишет
+// другая горутина (ReadPump -> sendJSON), приводило к panic "send on closed channel"
+// и падению всего процесса. Вместо этого используется канал done, закрываемый
+// ровно один раз через closeOnce.
 type Client struct {
-	hub      *Hub
-	conn     *websocket.Conn
-	send     chan []byte
-	userID   int64
-	deviceID string
-	mu       sync.Mutex
+	hub       *Hub
+	conn      *websocket.Conn
+	send      chan []byte
+	done      chan struct{}
+	closeOnce sync.Once
+	userID    int64
+	deviceID  string
+
+	lastSeenUpdate time.Time
+}
+
+func newClient(hub *Hub, conn *websocket.Conn, userID int64, deviceID string) *Client {
+	return &Client{
+		hub:      hub,
+		conn:     conn,
+		send:     make(chan []byte, 256),
+		done:     make(chan struct{}),
+		userID:   userID,
+		deviceID: deviceID,
+	}
+}
+
+// close сигнализирует WritePump завершиться. Идемпотентен и потокобезопасен.
+func (c *Client) close() {
+	c.closeOnce.Do(func() {
+		close(c.done)
+	})
+}
+
+// trySend кладёт сообщение в очередь отправки без блокировки.
+// Возвращает false, если клиент закрыт или буфер переполнен.
+func (c *Client) trySend(data []byte) bool {
+	select {
+	case <-c.done:
+		return false
+	default:
+	}
+
+	select {
+	case c.send <- data:
+		return true
+	case <-c.done:
+		return false
+	default:
+		// Буфер полон — клиент не успевает читать, сообщение придёт через sync
+		return false
+	}
 }
 
 // Hub - управляет всеми WebSocket подключениями
@@ -72,7 +124,8 @@ func (h *Hub) Run() {
 		case client := <-h.register:
 			h.mu.Lock()
 			if existing, ok := h.clients[client.deviceID]; ok && existing != client {
-				close(existing.send)
+				// Повторное подключение того же устройства — старое соединение закрываем
+				existing.close()
 			}
 			h.clients[client.deviceID] = client
 			h.mu.Unlock()
@@ -82,9 +135,9 @@ func (h *Hub) Run() {
 			h.mu.Lock()
 			if existing, ok := h.clients[client.deviceID]; ok && existing == client {
 				delete(h.clients, client.deviceID)
-				close(client.send)
 			}
 			h.mu.Unlock()
+			client.close()
 			log.Printf("📴 Client disconnected: device=%s", client.deviceID)
 
 		case msg := <-h.broadcast:
@@ -98,27 +151,14 @@ func (h *Hub) handleBroadcast(msg *BroadcastMessage) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 
-	if msg.RecipientID == 0 {
-		// Всем (кроме исключённого)
-		for deviceID, client := range h.clients {
-			if deviceID != msg.ExcludeDevice {
-				select {
-				case client.send <- msg.Data:
-				default:
-					// Буфер полон, пропускаем
-				}
-			}
+	for deviceID, client := range h.clients {
+		if deviceID == msg.ExcludeDevice {
+			continue
 		}
-	} else {
-		// Конкретному пользователю (все его устройства)
-		for deviceID, client := range h.clients {
-			if client.userID == msg.RecipientID && deviceID != msg.ExcludeDevice {
-				select {
-				case client.send <- msg.Data:
-				default:
-				}
-			}
+		if msg.RecipientID != 0 && client.userID != msg.RecipientID {
+			continue
 		}
+		client.trySend(msg.Data)
 	}
 }
 
@@ -138,23 +178,13 @@ func (h *Hub) SendToDevice(deviceID string, data []byte) {
 	h.mu.RUnlock()
 
 	if ok {
-		select {
-		case client.send <- data:
-		default:
-		}
+		client.trySend(data)
 	}
 }
 
 // RegisterClient регистрирует нового клиента
 func (h *Hub) RegisterClient(conn *websocket.Conn, userID int64, deviceID string) *Client {
-	client := &Client{
-		hub:      h,
-		conn:     conn,
-		send:     make(chan []byte, 256),
-		userID:   userID,
-		deviceID: deviceID,
-	}
-
+	client := newClient(h, conn, userID, deviceID)
 	h.register <- client
 	return client
 }
@@ -192,8 +222,11 @@ func (h *Hub) DisconnectDevice(deviceID string) {
 	client, ok := h.clients[deviceID]
 	if ok {
 		delete(h.clients, deviceID)
-		close(client.send)
-		client.conn.Close()
 	}
 	h.mu.Unlock()
+
+	if ok {
+		client.close()
+		client.conn.Close()
+	}
 }

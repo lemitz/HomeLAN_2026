@@ -106,16 +106,25 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     }
   }
 
-  void _sendMessage() {
+  Future<void> _sendMessage() async {
     final text = _messageController.text.trim();
     if (text.isEmpty) return;
 
     final chat = context.read<ChatProvider>();
-    chat.sendMessage(widget.userId, text);
-    
     _messageController.clear();
     _focusNode.requestFocus();
-    _scrollToBottom();
+
+    try {
+      await chat.sendMessage(widget.userId, text);
+      _scrollToBottom();
+    } on SendMessageException catch (e) {
+      // Возвращаем текст в поле, чтобы он не потерялся
+      _messageController.text = text;
+      _showError(e.message);
+    } catch (e) {
+      _messageController.text = text;
+      _showError('Не удалось отправить сообщение');
+    }
   }
 
   void _scrollToBottom() {
@@ -554,6 +563,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       
       _scrollToBottom();
       
+    } on SendMessageException catch (e) {
+      _showError(e.message);
     } catch (e) {
       _showError('Ошибка загрузки: $e');
     } finally {

@@ -23,9 +23,18 @@
     <uses-feature android:name="android.hardware.camera" android:required="false"/>
     <uses-feature android:name="android.hardware.camera.autofocus" android:required="false"/>
 
+    <!--
+        allowBackup=false: локальная БД, ключи и токен не должны попадать
+        в облачные/ADB-резервные копии. dataExtractionRules/fullBackupContent
+        дублируют запрет для Android 12+ и device-to-device переноса.
+        usesCleartextTraffic=true: сервер в LAN работает по HTTP (см. THREAT_MODEL.md).
+    -->
     <application
         android:label="HomeLAN"
         android:name="${applicationName}"
+        android:allowBackup="false"
+        android:fullBackupContent="@xml/backup_rules"
+        android:dataExtractionRules="@xml/data_extraction_rules"
         android:usesCleartextTraffic="true"
         android:icon="@mipmap/ic_launcher">
         

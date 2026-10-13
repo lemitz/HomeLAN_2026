@@ -58,6 +58,10 @@ class _NewDeviceLinkScreenState extends State<NewDeviceLinkScreen> {
       if (qrData['type'] == 'link_code') {
         final code = qrData['code'] as String;
         final key = qrData['key'] as String?;
+        if (key == null || key.isEmpty) {
+          _showError('QR-код не содержит ключ шифрования. Сгенерируйте код заново.');
+          return;
+        }
         await _completeLink(code, importedKey: key);
       }
     } catch (e) {
@@ -73,13 +77,20 @@ class _NewDeviceLinkScreenState extends State<NewDeviceLinkScreen> {
     });
 
     try {
-      // Если есть импортированный ключ — используем его
-      if (importedKey != null && importedKey.isNotEmpty) {
-        await cryptoService.importKeyPair(importedKey);
-        print('🔐 Imported key from QR code');
+      // Все устройства одного пользователя используют ОДНУ ключевую пару:
+      // без импорта ключа новое устройство не сможет читать переписку,
+      // а после его входа остальные устройства перестанут расшифровывать
+      // новые сообщения (сервер хранит один публичный ключ на пользователя).
+      if (importedKey == null || importedKey.isEmpty) {
+        throw Exception('Нужен код вместе с ключом шифрования');
       }
-      
-      // Получаем публичный ключ (свой или импортированный)
+      try {
+        await cryptoService.importKeyPair(importedKey);
+      } catch (_) {
+        throw Exception('Ключ повреждён. Скопируйте «код + ключ» заново '
+            '(ключ чувствителен к регистру)');
+      }
+
       final publicKey = await cryptoService.getPublicKey();
       
       // Завершаем привязку
@@ -125,22 +136,23 @@ class _NewDeviceLinkScreenState extends State<NewDeviceLinkScreen> {
   }
 
   void _submitCode() {
-    final input = _codeController.text.trim().toUpperCase();
+    final input = _codeController.text.trim();
     if (input.isEmpty) return;
-    
-    // Проверяем формат: CODE:KEY или просто CODE
-    if (input.contains(':')) {
-      final parts = input.split(':');
-      if (parts.length >= 2) {
-        final code = parts[0];
-        final key = parts.sublist(1).join(':'); // На случай если в ключе есть :
-        _completeLink(code, importedKey: key);
-        return;
-      }
+
+    // Формат: CODE:KEY. В верхний регистр переводим ТОЛЬКО код —
+    // ключ закодирован в base64 и чувствителен к регистру.
+    final sep = input.indexOf(':');
+    if (sep <= 0 || sep == input.length - 1) {
+      _showError(
+        'Введите код вместе с ключом (на основном устройстве нажмите '
+        '«Копировать код + ключ») или отсканируйте QR-код',
+      );
+      return;
     }
-    
-    // Только код без ключа
-    _completeLink(input);
+
+    final code = input.substring(0, sep).trim().toUpperCase();
+    final key = input.substring(sep + 1).replaceAll(RegExp(r'\s+'), '');
+    _completeLink(code, importedKey: key);
   }
 
   @override
@@ -269,7 +281,7 @@ class _NewDeviceLinkScreenState extends State<NewDeviceLinkScreen> {
                 ),
                 const SizedBox(height: 8),
                 Text(
-                  'Введите код (или код:ключ) с основного устройства',
+                  'Вставьте «код:ключ» с основного устройства',
                   style: TextStyle(color: Colors.grey[400]),
                   textAlign: TextAlign.center,
                 ),
@@ -285,7 +297,7 @@ class _NewDeviceLinkScreenState extends State<NewDeviceLinkScreen> {
                   textAlign: TextAlign.center,
                   textCapitalization: TextCapitalization.characters,
                   decoration: InputDecoration(
-                    hintText: 'XXXX-XXXX или код:ключ',
+                    hintText: 'XXXX-XXXX:ключ',
                     hintStyle: TextStyle(color: Colors.grey[600], fontSize: 14),
                     filled: true,
                     fillColor: Colors.grey[800],

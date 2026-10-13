@@ -16,7 +16,7 @@ type MDNSServer struct {
 }
 
 // New создаёт и запускает mDNS сервер
-func New(port int) (*MDNSServer, error) {
+func New(port int, version string) (*MDNSServer, error) {
 	hostname, err := os.Hostname()
 	if err != nil {
 		hostname = "homelan-server"
@@ -46,7 +46,7 @@ func New(port int) (*MDNSServer, error) {
 		port,            // Port
 		ips,             // IPs
 		[]string{ // TXT records info
-			"version=0.7.0",
+			"version=" + version,
 			"name=HomeLAN Server",
 		},
 	)

@@ -71,10 +71,13 @@ type SyncCursor struct {
 // Session - сессия пользователя
 type Session struct {
 	ID        int64  `json:"id"`
-	TokenHash string `json:"token_hash"`
+	TokenHash string `json:"-"` // хэш токена наружу не отдаём
 	UserID    int64  `json:"user_id"`
 	DeviceID  string `json:"device_id"`
 	CreatedAt int64  `json:"created_at"`
 	ExpiresAt int64  `json:"expires_at"`
 	IsRevoked bool   `json:"is_revoked"`
+	// DeviceRevoked = true, если устройство сессии отозвано или удалено.
+	// Такая сессия недействительна независимо от IsRevoked.
+	DeviceRevoked bool `json:"-"`
 }

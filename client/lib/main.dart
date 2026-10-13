@@ -2,21 +2,21 @@
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
-import 'package:shared_preferences/shared_preferences.dart';
 import 'services/services.dart';
-import 'services/mdns_service.dart';
 import 'providers/providers.dart';
 import 'screens/screens.dart';
 import 'screens/chat_screen.dart';
 
-const String defaultServerUrl = 'http://192.168.100.100:8080';
+import 'utils/app_log.dart';
 
+/// Ходим на сервер напрямую, минуя системный прокси (локальная сеть).
+/// Проверка TLS-сертификатов НЕ отключается: раньше badCertificateCallback
+/// принимал любой сертификат, что обесценивало бы https при его использовании.
 class MyHttpOverrides extends HttpOverrides {
   @override
   HttpClient createHttpClient(SecurityContext? context) {
     final client = super.createHttpClient(context);
     client.findProxy = (uri) => "DIRECT";
-    client.badCertificateCallback = (X509Certificate cert, String host, int port) => true;
     return client;
   }
 }
@@ -37,10 +37,11 @@ void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   HttpOverrides.global = MyHttpOverrides();
 
-  String serverUrl = await _discoverOrLoadServerUrl();
-  print('🏁 FINAL SERVER URL: $serverUrl');
+  // Сохранённый адрес используется как есть; mDNS — только при первом запуске
+  // или по кнопке пользователя (см. ServerConfig).
+  final serverUrl = await ServerConfig().load();
+  appLog('🏁 Server URL: $serverUrl (configured: ${ServerConfig().isConfigured})');
 
-  // Инициализируем ConnectionService для Windows
   if (isWindows) {
     ConnectionService().init(serverUrl);
   }
@@ -50,38 +51,25 @@ void main() async {
   dbService = DatabaseService();
   cryptoService = CryptoService();
   notificationService = NotificationService();
-  
+
+  // Смена адреса из UI применяется ко всем сетевым сервисам
+  ServerConfig().onChanged = applyServerUrl;
+
   if (isMobile) {
     await notificationService.init();
   }
-  
+
   runApp(HomeLanApp(serverUrl: serverUrl));
 }
 
-Future<String> _discoverOrLoadServerUrl() async {
-  final prefs = await SharedPreferences.getInstance();
-  
-  final savedUrl = prefs.getString('server_url');
-  if (savedUrl != null) {
-    print('📡 Found saved URL in cache: $savedUrl');
-    if (await MDNSService.checkServer(savedUrl)) {
-      print('✅ Saved URL is alive');
-      return savedUrl;
-    }
-    print('⚠️ Saved URL not responding, searching again...');
+/// Применяет новый адрес сервера ко всем сетевым сервисам.
+Future<void> applyServerUrl(String url) async {
+  apiService.baseUrl = url;
+  wsService.baseUrl = url;
+  if (isWindows) {
+    ConnectionService().init(url);
+    await ConnectionService().tryReconnect();
   }
-  
-  print('📡 Searching for HomeLAN server via mDNS...');
-  final discoveredUrl = await MDNSService.discoverServer();
-  
-  if (discoveredUrl != null) {
-    await prefs.setString('server_url', discoveredUrl);
-    print('🎉 mDNS found: $discoveredUrl');
-    return discoveredUrl;
-  }
-  
-  print('⚠️ mDNS failed, using default: $defaultServerUrl');
-  return defaultServerUrl;
 }
 
 class HomeLanApp extends StatelessWidget {
@@ -204,12 +192,10 @@ class _AppStartupState extends State<AppStartup> with WidgetsBindingObserver {
       if (auth.isLoggedIn && auth.userId != null) {
         final chat = context.read<ChatProvider>();
         chat.setUserId(auth.userId!);
-        
-        // Для Windows — запускаем мониторинг
-        if (isWindows) {
-          await ConnectionService().startMonitoring();
-        }
       }
+      // Мониторинг сервера на Windows запускает сам ServerGuardScreen:
+      // раньше он ждал startMonitoring() отсюда, а этот код не выполнялся,
+      // пока guard не покажет child — взаимная блокировка.
       
       notificationService.onNotificationTap = _onNotificationTap;
       

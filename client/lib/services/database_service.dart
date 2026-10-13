@@ -4,6 +4,7 @@ import 'package:path/path.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 import '../models/models.dart';
+import '../utils/app_log.dart';
 
 class DatabaseService {
   static Database? _database;
@@ -23,7 +24,7 @@ class DatabaseService {
     final directory = await getApplicationDocumentsDirectory();
     final path = join(directory.path, 'homelan_client.db');
 
-    print('Database path: $path');
+    appLog('Database path: $path');
 
     return await openDatabase(
       path,
@@ -125,10 +126,10 @@ class DatabaseService {
         },
         conflictAlgorithm: ConflictAlgorithm.replace,
       );
-      print('Inserted message seq_id=${message.seqId} sender=${message.senderId} recipient=${message.recipientId}');
+      appLog('Inserted message seq_id=${message.seqId} sender=${message.senderId} recipient=${message.recipientId}');
       return result;
     } catch (e) {
-      print('Error inserting message: $e');
+      appLog('Error inserting message: $e');
       return -1;
     }
   }
@@ -136,7 +137,7 @@ class DatabaseService {
   Future<List<Message>> getMessages(int oderId, int myId, {int limit = 50}) async {
     final db = await database;
     
-    print('Loading messages: oderId=$oderId myId=$myId');
+    appLog('Loading messages: oderId=$oderId myId=$myId');
     
     final List<Map<String, dynamic>> maps = await db.query(
       'messages',
@@ -146,7 +147,7 @@ class DatabaseService {
       limit: limit,
     );
 
-    print('Found ${maps.length} messages in local DB');
+    appLog('Found ${maps.length} messages in local DB');
 
     return List.generate(maps.length, (i) {
       final map = maps[i];
@@ -180,7 +181,7 @@ class DatabaseService {
     final db = await database;
     final result = await db.rawQuery('SELECT MAX(seq_id) as max_seq FROM messages');
     final maxSeq = result.first['max_seq'] as int? ?? 0;
-    print('Last seq_id in local DB: $maxSeq');
+    appLog('Last seq_id in local DB: $maxSeq');
     return maxSeq;
   }
 
@@ -211,7 +212,7 @@ class DatabaseService {
       where: 'sender_id = ? OR recipient_id = ?',
       whereArgs: [oderId, oderId],
     );
-    print('🗑️ Deleted all messages for user $oderId from local DB');
+    appLog('🗑️ Deleted all messages for user $oderId from local DB');
   }
 
   // НОВЫЙ МЕТОД: Получить всех юзеров с которыми есть переписка
@@ -344,15 +345,5 @@ class DatabaseService {
     await db.delete('users');
     await db.delete('settings');
     await db.delete('contacts');
-  }
-  
-  Future<void> printAllMessages() async {
-    final db = await database;
-    final maps = await db.query('messages');
-    print('=== All messages in DB (${maps.length}) ===');
-    for (var m in maps) {
-      print('seq=${m['seq_id']} from=${m['sender_id']} to=${m['recipient_id']} deleted=${m['is_deleted']}');
-    }
-    print('=== End ===');
   }
 }

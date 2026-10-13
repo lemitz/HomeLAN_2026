@@ -4,6 +4,7 @@ import 'package:flutter/foundation.dart';
 import 'package:cryptography/cryptography.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+import '../utils/app_log.dart';
 
 class CryptoService {
   static const String _privateKeyKey = 'private_key';
@@ -40,7 +41,7 @@ class CryptoService {
         // Remove from SharedPreferences
         await prefs.remove(_privateKeyKey);
         await prefs.remove(_publicKeyKey);
-        print('🔐 Migrated key pair to secure storage and deleted from SharedPreferences');
+        appLog('🔐 Migrated key pair to secure storage and deleted from SharedPreferences');
       }
     }
 
@@ -53,7 +54,7 @@ class CryptoService {
         publicKey: SimplePublicKey(publicKeyBytes, type: KeyPairType.x25519),
         type: KeyPairType.x25519,
       );
-      print('🔐 Loaded existing key pair from secure storage');
+      appLog('🔐 Loaded existing key pair from secure storage');
     } else {
       await generateKeyPair();
     }
@@ -80,7 +81,7 @@ class CryptoService {
     await prefs.remove(_privateKeyKey);
     await prefs.remove(_publicKeyKey);
 
-    print('🔐 Generated and saved new key pair in secure storage');
+    appLog('🔐 Generated and saved new key pair in secure storage');
   }
 
   static Future<Map<String, Uint8List>> _generateKeyPairIsolate(void _) async {
@@ -150,9 +151,9 @@ class CryptoService {
       await prefs.remove(_privateKeyKey);
       await prefs.remove(_publicKeyKey);
       
-      print('🔐 Imported key pair successfully into secure storage');
+      appLog('🔐 Imported key pair successfully into secure storage');
     } catch (e) {
-      print('🔐 Failed to import key pair: $e');
+      appLog('🔐 Failed to import key pair: $e');
       rethrow;
     }
   }
@@ -184,7 +185,7 @@ class CryptoService {
       // Migrate to secure storage
       await _secureStorage.write(key: _sessionTokenKey, value: token);
       await prefs.remove(_sessionTokenKey);
-      print('🔐 Migrated session token to secure storage');
+      appLog('🔐 Migrated session token to secure storage');
     }
     return token;
   }
@@ -199,7 +200,7 @@ class CryptoService {
 
   void setUserPublicKey(int userId, Uint8List publicKeyBytes) {
     _publicKeys[userId] = SimplePublicKey(publicKeyBytes, type: KeyPairType.x25519);
-    print('🔐 Stored public key for user $userId');
+    appLog('🔐 Stored public key for user $userId');
   }
 
   void setUserPublicKeyBase64(int userId, String publicKeyBase64) {
@@ -301,6 +302,6 @@ class CryptoService {
     
     _keyPair = null;
     _publicKeys.clear();
-    print('🔐 Cleared all keys from secure storage and preferences');
+    appLog('🔐 Cleared all keys from secure storage and preferences');
   }
 }

@@ -3,10 +3,27 @@ import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
+import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:open_filex/open_filex.dart';
 import '../models/models.dart';
 import '../providers/providers.dart';
+import '../utils/app_log.dart';
+
+/// Имя файла из метаданных приходит от собеседника — оставляем только
+/// базовое имя без путей и служебных символов, чтобы исключить path traversal
+/// ("../../x") и попытки записи вне временной директории.
+String sanitizeFileName(String? name, String fallback) {
+  if (name == null || name.trim().isEmpty) return fallback;
+  var base = p.basename(name.replaceAll('\\', '/')).trim();
+  base = base.replaceAll(RegExp(r'[\x00-\x1f<>:"|?*]'), '_');
+  if (base.isEmpty || base == '.' || base == '..') return fallback;
+  if (base.length > 120) {
+    final ext = p.extension(base);
+    base = base.substring(0, 120 - ext.length) + ext;
+  }
+  return base;
+}
 
 // Глобальный кэш превьюшек по seqId
 final Map<int, Uint8List> _imageCache = {};
@@ -158,7 +175,7 @@ class _MessageBubbleState extends State<MessageBubble> {
         });
       }
     } catch (e) {
-      print('Failed to load image for seq=${widget.message.seqId}: $e');
+      appLog('Failed to load image for seq=${widget.message.seqId}: $e');
       if (mounted) {
         setState(() {
           _isLoadingImage = false;
@@ -196,9 +213,12 @@ class _MessageBubbleState extends State<MessageBubble> {
     if (imageBytes == null) return;
 
     try {
-      final fileName = _fileMetadata?['file_name'] ?? 'image_${widget.message.seqId}.jpg';
+      final fileName = sanitizeFileName(
+        _fileMetadata?['file_name'] as String?,
+        'image_${widget.message.seqId}.jpg',
+      );
       final directory = await getTemporaryDirectory();
-      final filePath = '${directory.path}/$fileName';
+      final filePath = p.join(directory.path, fileName);
       
       final file = File(filePath);
       await file.writeAsBytes(imageBytes);
@@ -235,9 +255,12 @@ class _MessageBubbleState extends State<MessageBubble> {
         _downloadProgress = 0.8;
       });
 
-      final fileName = _fileMetadata?['file_name'] ?? 'file_${widget.message.seqId}';
+      final fileName = sanitizeFileName(
+        _fileMetadata?['file_name'] as String?,
+        'file_${widget.message.seqId}',
+      );
       final directory = await getTemporaryDirectory();
-      final filePath = '${directory.path}/$fileName';
+      final filePath = p.join(directory.path, fileName);
       
       final file = File(filePath);
       await file.writeAsBytes(fileBytes);
@@ -257,7 +280,7 @@ class _MessageBubbleState extends State<MessageBubble> {
         );
       }
     } catch (e) {
-      print('Download failed: $e');
+      appLog('Download failed: $e');
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text('Ошибка: $e'), backgroundColor: Colors.red[700]),

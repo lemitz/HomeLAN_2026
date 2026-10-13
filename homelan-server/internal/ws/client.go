@@ -3,11 +3,21 @@ package ws
 import (
 	"encoding/json"
 	"log"
+	"regexp"
 	"time"
 
 	"github.com/gorilla/websocket"
-	"homelan-server/internal/models" // Убедитесь, что импорт models корректен для вашего проекта
+	"homelan-server/internal/models"
 )
+
+var (
+	// content_type: короткий идентификатор вида "encrypted", "encrypted_file", "text"
+	contentTypeRe = regexp.MustCompile(`^[a-z][a-z0-9_]{0,31}$`)
+	// file_id: hex(16 случайных байт)
+	fileIDRe = regexp.MustCompile(`^[0-9a-f]{32}$`)
+)
+
+const maxClientIDLen = 64
 
 func (c *Client) ReadPump() {
 	defer func() {
@@ -16,24 +26,44 @@ func (c *Client) ReadPump() {
 	}()
 
 	c.conn.SetReadLimit(maxMessageSize)
-	c.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+	c.conn.SetReadDeadline(time.Now().Add(pongWait))
 
 	c.conn.SetPongHandler(func(string) error {
-		c.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		c.conn.SetReadDeadline(time.Now().Add(pongWait))
 		return nil
 	})
 
 	for {
 		_, message, err := c.conn.ReadMessage()
 		if err != nil {
-			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure, websocket.CloseNormalClosure) {
 				log.Printf("WebSocket error: %v", err)
 			}
 			break
 		}
 
-		c.hub.db.UpdateDeviceLastSeen(c.deviceID)
+		c.touch()
 		c.handleMessage(message)
+	}
+}
+
+// touch обновляет last_seen устройства и пользователя, но не чаще раза в
+// lastSeenUpdateInterval. Активность пользователя учитывается Dead Man's Switch,
+// поэтому важно обновлять её не только при подключении, но и при работе.
+func (c *Client) touch() {
+	if c.hub.db == nil {
+		return
+	}
+	now := time.Now()
+	if now.Sub(c.lastSeenUpdate) < lastSeenUpdateInterval {
+		return
+	}
+	c.lastSeenUpdate = now
+	if err := c.hub.db.UpdateDeviceLastSeen(c.deviceID); err != nil {
+		log.Printf("UpdateDeviceLastSeen error: %v", err)
+	}
+	if err := c.hub.db.UpdateUserLastSeen(c.userID); err != nil {
+		log.Printf("UpdateUserLastSeen error: %v", err)
 	}
 }
 
@@ -46,18 +76,15 @@ func (c *Client) WritePump() {
 
 	for {
 		select {
-		case message, ok := <-c.send:
+		case <-c.done:
 			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
-			if !ok {
-				c.conn.WriteMessage(websocket.CloseMessage, []byte{})
-				return
-			}
+			c.conn.WriteMessage(websocket.CloseMessage,
+				websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
+			return
 
-			c.mu.Lock()
-			err := c.conn.WriteMessage(websocket.TextMessage, message)
-			c.mu.Unlock()
-
-			if err != nil {
+		case message := <-c.send:
+			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if err := c.conn.WriteMessage(websocket.TextMessage, message); err != nil {
 				return
 			}
 
@@ -73,7 +100,6 @@ func (c *Client) WritePump() {
 func (c *Client) handleMessage(data []byte) {
 	var msg WSMessage
 	if err := json.Unmarshal(data, &msg); err != nil {
-		log.Printf("Invalid message format: %v", err)
 		c.sendError("invalid_format", "Invalid message format")
 		return
 	}
@@ -93,10 +119,10 @@ func (c *Client) handleMessage(data []byte) {
 		c.handleTyping(msg.Data)
 	case "ping":
 		c.handlePing()
-	case "time_sync": // NEW
-		c.handleTimeSync() // NEW
+	case "time_sync":
+		c.handleTimeSync()
 	default:
-		c.sendError("unknown_type", "Unknown message type: "+msg.Type)
+		c.sendError("unknown_type", "Unknown message type")
 	}
 }
 
@@ -107,6 +133,10 @@ func (c *Client) handleSendMessage(data json.RawMessage) {
 		ContentType      string `json:"content_type"`
 		FileID           string `json:"file_id,omitempty"`
 		ExpiresAt        int64  `json:"expires_at,omitempty"`
+		// ClientID — произвольный идентификатор, который клиент присвоил сообщению
+		// до отправки. Сервер возвращает его в message_sent, чтобы клиент мог
+		// однозначно сопоставить seq_id с нужным локальным сообщением.
+		ClientID string `json:"client_id,omitempty"`
 	}
 
 	if err := json.Unmarshal(data, &req); err != nil {
@@ -118,11 +148,43 @@ func (c *Client) handleSendMessage(data json.RawMessage) {
 		c.sendError("invalid_recipient", "Invalid recipient ID")
 		return
 	}
+	if len(req.EncryptedContent) == 0 {
+		c.sendError("invalid_data", "Empty message content")
+		return
+	}
+	if !contentTypeRe.MatchString(req.ContentType) {
+		c.sendError("invalid_data", "Invalid content_type")
+		return
+	}
+	if len(req.ClientID) > maxClientIDLen {
+		c.sendError("invalid_data", "client_id too long")
+		return
+	}
+	if req.ExpiresAt < 0 || (req.ExpiresAt > 0 && req.ExpiresAt <= time.Now().Unix()) {
+		c.sendError("invalid_data", "expires_at must be in the future")
+		return
+	}
 
 	recipient, err := c.hub.db.GetUserByID(req.RecipientID)
 	if err != nil || recipient == nil {
 		c.sendError("user_not_found", "Recipient user not found")
 		return
+	}
+
+	if req.FileID != "" {
+		if !fileIDRe.MatchString(req.FileID) {
+			c.sendError("invalid_data", "Invalid file_id")
+			return
+		}
+		file, err := c.hub.db.GetFileByID(req.FileID)
+		if err != nil || file == nil || file.IsDeleted {
+			c.sendError("file_not_found", "File not found")
+			return
+		}
+		if file.UploaderID != c.userID {
+			c.sendError("forbidden", "File belongs to another user")
+			return
+		}
 	}
 
 	message, err := c.hub.db.CreateMessage(
@@ -144,6 +206,7 @@ func (c *Client) handleSendMessage(data json.RawMessage) {
 		"data": map[string]interface{}{
 			"seq_id":     message.SeqID,
 			"created_at": message.CreatedAt,
+			"client_id":  req.ClientID,
 		},
 	})
 
@@ -185,13 +248,14 @@ func (c *Client) handleSync(data json.RawMessage) {
 
 	var messages []*models.Message
 	var err error
+	direction := "forward"
 
 	if req.BeforeSeqID > 0 {
 		// Пагинация назад (старые сообщения)
-		// Примечание: предполагается, что метод GetMessagesBefore реализован в c.hub.db
+		direction = "backward"
 		messages, err = c.hub.db.GetMessagesBefore(c.userID, req.BeforeSeqID, req.Limit)
 	} else {
-		// Обычная синхронизация (новые сообщения)
+		// Обычная синхронизация (новые сообщения + tombstone удалённых)
 		messages, err = c.hub.db.GetMessagesSince(c.userID, req.SinceSeqID, req.Limit)
 	}
 
@@ -201,7 +265,11 @@ func (c *Client) handleSync(data json.RawMessage) {
 		return
 	}
 
-	if len(messages) > 0 && req.BeforeSeqID == 0 {
+	if messages == nil {
+		messages = []*models.Message{}
+	}
+
+	if len(messages) > 0 && direction == "forward" {
 		// Обновляем курсор только при запросе новых сообщений вперёд
 		lastSeq := messages[len(messages)-1].SeqID
 		c.hub.db.UpdateSyncCursor(c.deviceID, lastSeq)
@@ -212,12 +280,14 @@ func (c *Client) handleSync(data json.RawMessage) {
 		"data": map[string]interface{}{
 			"messages":    messages,
 			"has_more":    len(messages) == req.Limit,
+			"direction":   direction,
 			"server_time": time.Now().Unix(),
 		},
 	})
 }
 
-func (c *Client) handleAck(data json.RawMessage) {
+// statusUpdate обрабатывает ack/read: статус может ставить только получатель сообщения.
+func (c *Client) statusUpdate(data json.RawMessage, status string) {
 	var req struct {
 		SeqID int64 `json:"seq_id"`
 	}
@@ -227,48 +297,36 @@ func (c *Client) handleAck(data json.RawMessage) {
 	}
 
 	message, err := c.hub.db.GetMessageBySeqID(req.SeqID)
-	if err != nil || message == nil {
+	if err != nil || message == nil || message.IsDeleted {
+		return
+	}
+	if message.RecipientID != c.userID {
+		// Отправитель (или кто-то посторонний) не может подтверждать доставку/прочтение
 		return
 	}
 
-	c.hub.db.SetMessageStatus(message.ID, c.deviceID, "delivered")
+	if err := c.hub.db.SetMessageStatus(message.ID, c.deviceID, status); err != nil {
+		log.Printf("SetMessageStatus error: %v", err)
+		return
+	}
 
-	ackData, _ := json.Marshal(map[string]interface{}{
+	payload, _ := json.Marshal(map[string]interface{}{
 		"type": "status_update",
 		"data": map[string]interface{}{
 			"seq_id":    req.SeqID,
 			"device_id": c.deviceID,
-			"status":    "delivered",
+			"status":    status,
 		},
 	})
-	c.hub.SendToUser(message.SenderID, ackData, "")
+	c.hub.SendToUser(message.SenderID, payload, "")
+}
+
+func (c *Client) handleAck(data json.RawMessage) {
+	c.statusUpdate(data, "delivered")
 }
 
 func (c *Client) handleRead(data json.RawMessage) {
-	var req struct {
-		SeqID int64 `json:"seq_id"`
-	}
-
-	if err := json.Unmarshal(data, &req); err != nil {
-		return
-	}
-
-	message, err := c.hub.db.GetMessageBySeqID(req.SeqID)
-	if err != nil || message == nil {
-		return
-	}
-
-	c.hub.db.SetMessageStatus(message.ID, c.deviceID, "read")
-
-	readData, _ := json.Marshal(map[string]interface{}{
-		"type": "status_update",
-		"data": map[string]interface{}{
-			"seq_id":    req.SeqID,
-			"device_id": c.deviceID,
-			"status":    "read",
-		},
-	})
-	c.hub.SendToUser(message.SenderID, readData, "")
+	c.statusUpdate(data, "read")
 }
 
 func (c *Client) handleDelete(data json.RawMessage) {
@@ -287,6 +345,10 @@ func (c *Client) handleDelete(data json.RawMessage) {
 
 	if message.SenderID != c.userID {
 		c.sendError("forbidden", "Cannot delete other's messages")
+		return
+	}
+
+	if message.IsDeleted {
 		return
 	}
 
@@ -316,6 +378,9 @@ func (c *Client) handleTyping(data json.RawMessage) {
 	if err := json.Unmarshal(data, &req); err != nil {
 		return
 	}
+	if req.RecipientID == 0 || req.RecipientID == c.userID {
+		return
+	}
 
 	typingData, _ := json.Marshal(map[string]interface{}{
 		"type": "user_typing",
@@ -327,7 +392,7 @@ func (c *Client) handleTyping(data json.RawMessage) {
 	c.hub.SendToUser(req.RecipientID, typingData, "")
 }
 
-// NEW: Обработка запроса синхронизации времени
+// handleTimeSync — ответ на запрос синхронизации времени
 func (c *Client) handleTimeSync() {
 	c.sendJSON(map[string]interface{}{
 		"type": "time_sync_response",
@@ -337,13 +402,13 @@ func (c *Client) handleTimeSync() {
 	})
 }
 
-// handlePing обновлен: добавлен timestamp
 func (c *Client) handlePing() {
+	now := time.Now().Unix()
 	c.sendJSON(map[string]interface{}{
 		"type":      "pong",
-		"timestamp": time.Now().Unix(), // NEW
+		"timestamp": now,
 		"data": map[string]interface{}{
-			"server_time": time.Now().Unix(),
+			"server_time": now,
 		},
 	})
 }
@@ -353,11 +418,7 @@ func (c *Client) sendJSON(v interface{}) {
 	if err != nil {
 		return
 	}
-
-	select {
-	case c.send <- data:
-	default:
-	}
+	c.trySend(data)
 }
 
 func (c *Client) sendError(code, message string) {

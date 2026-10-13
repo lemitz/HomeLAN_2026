@@ -1,4 +1,5 @@
 // lib/screens/link_device_screen.dart
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'package:flutter/material.dart';
@@ -22,6 +23,38 @@ class _LinkDeviceScreenState extends State<LinkDeviceScreen> {
   bool _isLoading = false;
   bool _isScanning = false;
   String? _error;
+
+  /// Через сколько буфер обмена очищается после копирования приватного ключа
+  static const Duration clipboardClearDelay = Duration(seconds: 60);
+  Timer? _clipboardTimer;
+  String? _lastCopied;
+
+  @override
+  void dispose() {
+    _clipboardTimer?.cancel();
+    // Уходим с экрана — ключ в буфере больше не нужен
+    _clearClipboardIfOurs();
+    super.dispose();
+  }
+
+  /// Очищает буфер обмена, только если там всё ещё наши данные
+  Future<void> _clearClipboardIfOurs() async {
+    final ours = _lastCopied;
+    if (ours == null) return;
+    try {
+      final current = await Clipboard.getData(Clipboard.kTextPlain);
+      if (current?.text == ours) {
+        await Clipboard.setData(const ClipboardData(text: ''));
+      }
+    } catch (_) {}
+    _lastCopied = null;
+  }
+
+  void _scheduleClipboardClear(String copied) {
+    _lastCopied = copied;
+    _clipboardTimer?.cancel();
+    _clipboardTimer = Timer(clipboardClearDelay, _clearClipboardIfOurs);
+  }
 
   bool get _isDesktop => Platform.isWindows || Platform.isLinux || Platform.isMacOS;
 
@@ -64,18 +97,27 @@ class _LinkDeviceScreenState extends State<LinkDeviceScreen> {
   void _copyCode() {
     if (_linkCode != null) {
       Clipboard.setData(ClipboardData(text: _linkCode!));
+      _scheduleClipboardClear(_linkCode!);
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Код скопирован')),
       );
     }
   }
 
+  /// Копирует код вместе с ПРИВАТНЫМ ключом. Буфер обмена читают любые
+  /// приложения, поэтому он автоматически очищается через минуту.
   void _copyFullData() {
     if (_linkCode != null && _exportedKey != null) {
       final fullData = '$_linkCode:$_exportedKey';
       Clipboard.setData(ClipboardData(text: fullData));
+      _scheduleClipboardClear(fullData);
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Код и ключ скопированы')),
+        SnackBar(
+          content: Text(
+            'Код и ключ скопированы. Буфер обмена очистится через '
+            '${clipboardClearDelay.inSeconds} с',
+          ),
+        ),
       );
     }
   }

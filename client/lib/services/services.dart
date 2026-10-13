@@ -10,4 +10,5 @@ export 'linking_service.dart';
 export 'biometric_service.dart';
 export 'foreground_service.dart';
 export 'mdns_service.dart';
-export 'connection_service.dart';  // ДОБАВИТЬ
+export 'connection_service.dart';
+export 'server_config.dart';

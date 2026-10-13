@@ -3,7 +3,7 @@ module homelan-server
 go 1.21
 
 require (
-	github.com/gorilla/websocket v1.5.1
+	github.com/gorilla/websocket v1.5.3
 	github.com/hashicorp/mdns v1.0.6
 	github.com/mutecomm/go-sqlcipher/v4 v4.4.2
 	golang.org/x/crypto v0.32.0

@@ -4,6 +4,21 @@ plugins {
     id "dev.flutter.flutter-gradle-plugin"
 }
 
+// Release-подпись: android/key.properties (НЕ коммитить, см. .gitignore):
+//   storeFile=/абсолютный/путь/homelan-release.jks
+//   storePassword=...
+//   keyAlias=homelan
+//   keyPassword=...
+def keystoreProperties = new Properties()
+def keystorePropertiesFile = rootProject.file('key.properties')
+def hasReleaseKeystore = false
+if (keystorePropertiesFile.exists()) {
+    keystorePropertiesFile.withReader('UTF-8') { reader ->
+        keystoreProperties.load(reader)
+    }
+    hasReleaseKeystore = keystoreProperties['storeFile'] != null
+}
+
 android {
     namespace "com.homelan.homelan_client"
     compileSdk 36
@@ -27,14 +42,34 @@ android {
         applicationId "com.homelan.homelan_client"
         minSdkVersion flutter.minSdkVersion
         targetSdk 36
-        versionCode 1
-        versionName "0.1.0"
+        // Версия берётся из pubspec.yaml (version: X.Y.Z+N) — единый источник
+        versionCode flutter.versionCode
+        versionName flutter.versionName
         multiDexEnabled true
+    }
+
+    signingConfigs {
+        if (hasReleaseKeystore) {
+            release {
+                storeFile file(keystoreProperties['storeFile'])
+                storePassword keystoreProperties['storePassword']
+                keyAlias keystoreProperties['keyAlias']
+                keyPassword keystoreProperties['keyPassword']
+            }
+        }
     }
 
     buildTypes {
         release {
-            signingConfig signingConfigs.debug
+            if (hasReleaseKeystore) {
+                signingConfig signingConfigs.release
+            } else {
+                // Debug-ключ одинаков на всех машинах разработчиков: такой APK
+                // может «обновить» кто угодно, собравший приложение с тем же
+                // applicationId. Для реальной установки создайте key.properties.
+                logger.warn("WARNING: android/key.properties not found — release APK will be signed with the DEBUG key. See docs/DEPLOYMENT.md")
+                signingConfig signingConfigs.debug
+            }
             minifyEnabled false
             shrinkResources false
         }

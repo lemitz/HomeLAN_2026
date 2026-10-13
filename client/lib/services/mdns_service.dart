@@ -2,6 +2,7 @@
 import 'dart:async';
 import 'dart:io';
 import 'package:multicast_dns/multicast_dns.dart';
+import '../utils/app_log.dart';
 
 class MDNSService {
   static const String serviceType = '_homelan._tcp.local';
@@ -31,7 +32,7 @@ class MDNSService {
           ).timeout(const Duration(seconds: 2), onTimeout: (sink) => sink.close())) {
             
             serverUrl = 'http://${ip.address.address}:${srv.port}';
-            print('📡 mDNS: Found server at $serverUrl');
+            appLog('📡 mDNS: Found server at $serverUrl');
             break;
           }
           if (serverUrl != null) break;
@@ -42,7 +43,7 @@ class MDNSService {
       client.stop();
       return serverUrl;
     } catch (e) {
-      print('📡 mDNS discovery failed: $e');
+      appLog('📡 mDNS discovery failed: $e');
       return null;
     }
   }

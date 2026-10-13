@@ -1,0 +1,7 @@
+# Скопируйте в android/key.properties и заполните. Файл key.properties в .gitignore.
+# Создать keystore:
+#   keytool -genkey -v -keystore homelan-release.jks -keyalg RSA -keysize 4096 -validity 10000 -alias homelan
+storeFile=/absolute/path/to/homelan-release.jks
+storePassword=CHANGE_ME
+keyAlias=homelan
+keyPassword=CHANGE_ME

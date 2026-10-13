@@ -34,13 +34,14 @@ class _RegisterScreenState extends State<RegisterScreen> {
       return;
     }
 
-    if (username.length < 3) {
-      _showError('Логин минимум 3 символа');
+    if (username.length < 3 || username.length > 32 ||
+        !RegExp(r'^[A-Za-z0-9_.-]+$').hasMatch(username)) {
+      _showError('Логин: 3–32 символа, латиница, цифры, "_", ".", "-"');
       return;
     }
 
-    if (password.length < 4) {
-      _showError('Пароль минимум 4 символа');
+    if (password.length < minPasswordLength) {
+      _showError('Пароль минимум $minPasswordLength символов');
       return;
     }
 

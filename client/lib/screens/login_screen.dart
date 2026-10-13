@@ -1,7 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import '../providers/providers.dart';
-import '../services/services.dart';
+import '../widgets/server_address_dialog.dart';
 import 'register_screen.dart';
 import 'new_device_link_screen.dart';
 
@@ -95,7 +95,10 @@ class _LoginScreenState extends State<LoginScreen> {
                     color: Colors.grey[400],
                   ),
                 ),
-                const SizedBox(height: 48),
+                const SizedBox(height: 12),
+                // Адрес сервера: виден и редактируется прямо с экрана входа
+                const ServerAddressRow(),
+                const SizedBox(height: 28),
                 TextField(
                   controller: _usernameController,
                   style: const TextStyle(color: Colors.white),

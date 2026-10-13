@@ -1,5 +1,5 @@
 #define MyAppName "HomeLAN"
-#define MyAppVersion "0.9.0"
+#define MyAppVersion "0.5.0"
 #define MyAppPublisher "LTZ xWorks"
 #define MyAppExeName "homelan_client.exe"
 #define MyAppURL "nato.vpanike"

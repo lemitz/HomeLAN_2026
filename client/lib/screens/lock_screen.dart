@@ -76,8 +76,9 @@ class _LockScreenState extends State<LockScreen> with WidgetsBindingObserver {
       debugPrint('🔒 Auth error: $e');
       if (mounted) {
         setState(() {
-          // При ошибке — разблокируем чтобы не застрять
-          _isLocked = false;
+          // Fail-closed: при ошибке остаёмся заблокированными,
+          // пользователь может повторить попытку кнопкой
+          _isLocked = true;
           _isAuthenticating = false;
         });
       }
@@ -143,7 +144,16 @@ class _LockScreenState extends State<LockScreen> with WidgetsBindingObserver {
                     ),
                   ],
                 )
-              else
+              else ...[
+                if (BiometricService().lastError != null)
+                  Padding(
+                    padding: const EdgeInsets.only(left: 32, right: 32, bottom: 16),
+                    child: Text(
+                      BiometricService().lastError!,
+                      textAlign: TextAlign.center,
+                      style: TextStyle(color: Colors.orange[300], fontSize: 13),
+                    ),
+                  ),
                 ElevatedButton.icon(
                   onPressed: _authenticate,
                   icon: const Icon(Icons.fingerprint),
@@ -155,6 +165,7 @@ class _LockScreenState extends State<LockScreen> with WidgetsBindingObserver {
                     ),
                   ),
                 ),
+              ],
             ],
           ),
         ),

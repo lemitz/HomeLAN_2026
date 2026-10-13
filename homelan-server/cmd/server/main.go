@@ -1,11 +1,8 @@
 package main
 
 import (
-	"crypto/rand"
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -13,27 +10,37 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/gorilla/websocket"
-	"golang.org/x/crypto/bcrypt"
 	"homelan-server/internal/config"
 	"homelan-server/internal/db"
 	"homelan-server/internal/linking"
 	"homelan-server/internal/mdns"
-	"homelan-server/internal/models"
-	"homelan-server/internal/panic"
+	wipe "homelan-server/internal/panic"
+	"homelan-server/internal/ratelimit"
 	"homelan-server/internal/usb"
-	"homelan-server/internal/utils"
 	"homelan-server/internal/ws"
 )
 
+// Version — единая версия сервера (используется в логах и mDNS TXT-записи)
+const Version = "0.5.0"
+
 const (
-	maxFileSize = 100 << 20 // 100MB
-	uploadPath  = "./data/files"
+	sessionDuration       = 30 * 24 * time.Hour // срок жизни сессии
+	sessionRenewThreshold = 15 * 24 * time.Hour // продлевать, если осталось меньше
+	sessionPruneAge       = 7 * 24 * time.Hour  // хранить истёкшие/отозванные сессии не дольше
+
+	// Защита от перебора: 5 неудачных попыток на пару ip+username, 30 неудачных с одного IP
+	loginUserFailures = 5
+	loginIPFailures   = 30
+	loginBaseDelay    = 30 * time.Second
+	loginMaxDelay     = 15 * time.Minute
+
+	linkCodeFailures = 10
 )
 
 type Server struct {
@@ -43,64 +50,77 @@ type Server struct {
 	upgrader       websocket.Upgrader
 	masterKey      []byte
 	keyPath        string
-	panicHandler   *panic.PanicHandler
+	panicHandler   *wipe.PanicHandler
 	linkingService *linking.LinkingService
 	mdnsServer     *mdns.MDNSServer
+
+	storagePath string
+	maxFileSize int64
+	maxStorage  int64
+
+	loginUserLimiter *ratelimit.Limiter
+	loginIPLimiter   *ratelimit.Limiter
+	linkLimiter      *ratelimit.Limiter
+
+	// registerMu сериализует регистрацию: проверка max_users/admin и вставка
+	// должны быть атомарны относительно друг друга.
+	registerMu sync.Mutex
+
+	// exitFunc вызывается после завершения panic wipe (в тестах подменяется)
+	exitFunc func()
 }
 
 func NewServer(cfg *config.Config, masterKey []byte, keyPath string) (*Server, error) {
+	storagePath, err := filepath.Abs(cfg.Files.StoragePath)
+	if err != nil {
+		return nil, fmt.Errorf("invalid storage path: %w", err)
+	}
+	if err := os.MkdirAll(storagePath, 0700); err != nil {
+		return nil, fmt.Errorf("failed to create storage directory: %w", err)
+	}
+
 	database, err := db.New(cfg.Database.Path, masterKey)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to database: %w", err)
 	}
 
-	hub := ws.NewHub(database)
-
-	panicHandler := panic.New(
-		database,
-		cfg.Database.Path,
-		cfg.Files.StoragePath,
-		func() { os.Exit(1) },
-	)
-
-	linkingService := linking.NewLinkingService()
-
-	mdnsServer, err := mdns.New(cfg.Server.Port)
-	if err != nil {
-		log.Printf("⚠️ mDNS failed to start: %v", err)
-	} else {
-		log.Printf("📡 mDNS service started")
-	}
-
-	return &Server{
-		config:         cfg,
-		db:             database,
-		hub:            hub,
-		masterKey:      masterKey,
-		keyPath:        keyPath,
-		panicHandler:   panicHandler,
-		linkingService: linkingService,
-		mdnsServer:     mdnsServer,
+	s := &Server{
+		config:           cfg,
+		db:               database,
+		hub:              ws.NewHub(database),
+		masterKey:        masterKey,
+		keyPath:          keyPath,
+		linkingService:   linking.NewLinkingService(),
+		storagePath:      storagePath,
+		maxFileSize:      cfg.MaxFileSizeBytes(),
+		maxStorage:       cfg.MaxStorageBytes(),
+		loginUserLimiter: ratelimit.New(loginUserFailures, loginBaseDelay, loginMaxDelay),
+		loginIPLimiter:   ratelimit.New(loginIPFailures, loginBaseDelay, loginMaxDelay),
+		linkLimiter:      ratelimit.New(linkCodeFailures, loginBaseDelay, loginMaxDelay),
+		exitFunc:         func() { os.Exit(1) },
 		upgrader: websocket.Upgrader{
 			ReadBufferSize:  1024,
 			WriteBufferSize: 1024,
-			CheckOrigin: func(r *http.Request) bool {
-				return true
-			},
+			// CheckOrigin не задан: gorilla по умолчанию пропускает запросы без Origin
+			// (нативные клиенты) и требует совпадения Origin с Host для браузеров.
 		},
-	}, nil
+	}
+
+	// Путь к БД и хранилищу для вайпа берём из конфига — те же, что использует
+	// сервер. Раньше аплоад писал в захардкоженный ./data/files, и при смене
+	// storage_path в конфиге вайп не трогал реальные файлы.
+	s.panicHandler = wipe.New(database, cfg.Database.Path, storagePath, func() { s.exitFunc() })
+
+	return s, nil
 }
 
-func (s *Server) Start() error {
-	go s.hub.Run()
-	go s.cleanupLoop()
-	go s.deadManSwitchLoop()
-	go s.usbWatchLoop()
-
+// routes собирает HTTP-маршруты (вынесено отдельно для тестов)
+func (s *Server) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("/api/register", s.handleRegister)
 	mux.HandleFunc("/api/login", s.handleLogin)
+	mux.HandleFunc("/api/logout", s.handleLogout)
 	mux.HandleFunc("/api/time", s.handleTime)
 	mux.HandleFunc("/api/user/", s.handleGetUser)
 	mux.HandleFunc("/api/partner", s.handleGetPartner)
@@ -108,7 +128,6 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/api/files/upload", s.handleFileUpload)
 	mux.HandleFunc("/api/files/", s.handleFiles)
 	mux.HandleFunc("/api/panic", s.handlePanic)
-	mux.HandleFunc("/api/logout", s.handleLogout)
 
 	// Device Linking
 	mux.HandleFunc("/api/devices/link/create", s.handleLinkCreate)
@@ -116,69 +135,103 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/api/devices", s.handleDevicesList)
 	mux.HandleFunc("/api/devices/revoke", s.handleDeviceRevoke)
 
+	return secureHeaders(mux)
+}
+
+// secureHeaders добавляет базовые защитные заголовки ко всем ответам
+func secureHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("Cache-Control", "no-store")
+		h.Set("Referrer-Policy", "no-referrer")
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (s *Server) startMDNS() {
+	mdnsServer, err := mdns.New(s.config.Server.Port, Version)
+	if err != nil {
+		log.Printf("⚠️ mDNS failed to start: %v", err)
+		log.Printf("   Клиенты не найдут сервер автоматически — укажите адрес вручную в настройках клиента")
+		return
+	}
+	s.mdnsServer = mdnsServer
+	log.Printf("📡 mDNS service started")
+}
+
+func (s *Server) Start() error {
+	go s.hub.Run()
+	go s.cleanupLoop()
+	if s.config.DeadMan.Enabled {
+		go s.deadManSwitchLoop()
+	} else {
+		log.Printf("💀 Dead Man's Switch: disabled")
+	}
+	if s.keyPath != "" {
+		go s.usbWatchLoop()
+	}
+	s.startMDNS()
+
 	addr := fmt.Sprintf("%s:%d", s.config.Server.Host, s.config.Server.Port)
 	server := &http.Server{
-		Addr:         addr,
-		Handler:      mux,
-		ReadTimeout:  time.Duration(s.config.Timeouts.ReadSeconds) * time.Second,
-		WriteTimeout: time.Duration(s.config.Timeouts.WriteSeconds) * time.Second,
-		IdleTimeout:  time.Duration(s.config.Timeouts.IdleSeconds) * time.Second,
+		Addr:              addr,
+		Handler:           s.routes(),
+		ReadTimeout:       time.Duration(s.config.Timeouts.ReadSeconds) * time.Second,
+		ReadHeaderTimeout: 10 * time.Second,
+		WriteTimeout:      time.Duration(s.config.Timeouts.WriteSeconds) * time.Second,
+		IdleTimeout:       time.Duration(s.config.Timeouts.IdleSeconds) * time.Second,
+		MaxHeaderBytes:    64 << 10,
 	}
 
-	log.Printf("🚀 HomeLAN Server starting on %s", addr)
+	log.Printf("🚀 HomeLAN Server %s starting on %s", Version, addr)
 	log.Printf("👥 Max users: %d", s.config.Security.MaxUsers)
+	log.Printf("📁 Files: %s (max file %d MB, quota %d MB)", s.storagePath, s.config.Files.MaxFileSizeMB, s.config.Files.MaxSizeMB)
 	return server.ListenAndServe()
 }
 
-// usbWatchLoop - БЕЗОПАСНАЯ ВЕРСИЯ С ЗАЩИТОЙ ОТ "ДРЕБЕЗГА"
+// usbWatchLoop — проверка наличия USB-ключа с защитой от «дребезга».
 // Проверяет наличие ключа, читая байт (обход кэша).
 // Если ошибка -> делает 3 быстрых повтора. Если все 3 с ошибкой -> ПАНИКА.
 func (s *Server) usbWatchLoop() {
 	log.Printf("👀 Watching USB key at: %s", s.keyPath)
 
-	// Проверяем каждую секунду
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
-	// Настройки безопасности (защита от случайного сбоя питания)
 	const maxRetries = 3                     // Сколько раз перепроверить перед удалением
-	const retryDelay = 50 * time.Millisecond // Пауза между проверками (очень быстро)
+	const retryDelay = 50 * time.Millisecond // Пауза между проверками
+
+	checkUSB := func() error {
+		f, err := os.Open(s.keyPath)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+
+		// Читаем 1 байт, чтобы заставить систему опросить USB-контроллер
+		buf := make([]byte, 1)
+		_, err = f.Read(buf)
+		if err != nil && err != io.EOF {
+			return err
+		}
+		return nil
+	}
 
 	for range ticker.C {
-		// Внутренняя функция для проверки (возвращает ошибку, если флешки нет)
-		checkUSB := func() error {
-			f, err := os.Open(s.keyPath)
-			if err != nil {
-				return err // Ошибка открытия
-			}
-			defer f.Close()
-
-			// Читаем 1 байт, чтобы заставить систему опросить USB-контроллер
-			buf := make([]byte, 1)
-			_, err = f.Read(buf)
-			if err != nil && err != io.EOF {
-				return err // Ошибка ввода-вывода (I/O error)
-			}
-			return nil // Всё ок
-		}
-
-		// Первая попытка
 		if err := checkUSB(); err != nil {
 			log.Printf("⚠️ USB Check Warning: %v. Retrying...", err)
 
 			confirmedMissing := true
-			// Начинаем цикл перепроверки
 			for i := 0; i < maxRetries; i++ {
-				time.Sleep(retryDelay) // Ждем чуть-чуть
+				time.Sleep(retryDelay)
 				if errRetry := checkUSB(); errRetry == nil {
-					// Флешка "вернулась" (значит это был глюк питания или драйвера)
 					log.Printf("✅ USB recovered after glitch. False alarm cancelled.")
 					confirmedMissing = false
 					break
 				}
 			}
 
-			// Если после всех попыток она всё ещё не читается — ВЗРЫВАЕМ
 			if confirmedMissing {
 				log.Printf("🚨 USB GONE CONFIRMED after %d retries. TRIGGERING PANIC.", maxRetries)
 				s.panicHandler.Trigger("USB_KEY_GONE_CONFIRMED")
@@ -188,994 +241,111 @@ func (s *Server) usbWatchLoop() {
 	}
 }
 
-func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"status":      "ok",
-		"server_time": time.Now().Unix(),
-	})
-}
-
-func (s *Server) handleTime(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"server_time": time.Now().Unix(),
-	})
-}
-
-func (s *Server) handlePanic(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	session, err := s.authenticate(r)
-	if err != nil {
-		http.Error(w, "Unauthorized: "+err.Error(), http.StatusUnauthorized)
-		return
-	}
-
-	user, err := s.db.GetUserByID(session.UserID)
-	if err != nil || user == nil {
-		http.Error(w, "User not found", http.StatusUnauthorized)
-		return
-	}
-
-	if !user.IsAdmin {
-		http.Error(w, "Forbidden: Admin access required", http.StatusForbidden)
-		return
-	}
-
-	var req struct {
-		Confirm string `json:"confirm"`
-	}
-
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Invalid JSON", http.StatusBadRequest)
-		return
-	}
-
-	if req.Confirm != "DESTROY_ALL_DATA" {
-		http.Error(w, "Invalid confirmation", http.StatusBadRequest)
-		return
-	}
-
-	log.Printf("🚨 PANIC INITIATED via API by admin user: %s (ID: %d)", user.Username, user.ID)
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"status": "panic_initiated",
-	})
-
-	go func() {
-		time.Sleep(500 * time.Millisecond)
-		s.panicHandler.Trigger("MANUAL_PANIC_API")
-	}()
-}
-
-func (s *Server) handleGetUser(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	session, err := s.authenticate(r)
-	if err != nil {
-		http.Error(w, "Unauthorized: "+err.Error(), http.StatusUnauthorized)
-		return
-	}
-
-	userIDStr := filepath.Base(r.URL.Path)
-	userID, err := strconv.ParseInt(userIDStr, 10, 64)
-	if err != nil {
-		http.Error(w, "Invalid user ID", http.StatusBadRequest)
-		return
-	}
-
-	// Only allow own details or partner's details (since it's a 2-user system)
-	if userID != session.UserID {
-		partner, err := s.db.GetPartner(session.UserID)
-		if err != nil {
-			http.Error(w, "Internal error", http.StatusInternalServerError)
-			return
-		}
-		if partner == nil || partner.ID != userID {
-			http.Error(w, "Forbidden", http.StatusForbidden)
-			return
-		}
-	}
-
-	user, err := s.db.GetUserByID(userID)
-	if err != nil {
-		http.Error(w, "Internal error", http.StatusInternalServerError)
-		return
-	}
-	if user == nil {
-		http.Error(w, "User not found", http.StatusNotFound)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"id":         user.ID,
-		"username":   user.Username,
-		"public_key": user.PublicKey,
-		"is_admin":   user.IsAdmin,
-	})
-}
-
-func (s *Server) handleGetPartner(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	session, err := s.authenticate(r)
-	if err != nil {
-		http.Error(w, "Unauthorized: "+err.Error(), http.StatusUnauthorized)
-		return
-	}
-
-	partner, err := s.db.GetPartner(session.UserID)
-	if err != nil {
-		http.Error(w, "Internal error", http.StatusInternalServerError)
-		return
-	}
-	if partner == nil {
-		http.Error(w, "No partner found", http.StatusNotFound)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"id":          partner.ID,
-		"username":    partner.Username,
-		"public_key":  partner.PublicKey,
-		"server_time": time.Now().Unix(),
-	})
-}
-
-func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
-	session, err := s.authenticate(r)
-	if err != nil {
-		http.Error(w, "Unauthorized: "+err.Error(), http.StatusUnauthorized)
-		return
-	}
-
-	deviceID := r.URL.Query().Get("device_id")
-	if deviceID != "" && deviceID != session.DeviceID {
-		http.Error(w, "Forbidden: device ID mismatch", http.StatusForbidden)
-		return
-	}
-
-	device, err := s.db.GetDeviceByID(session.DeviceID)
-	if err != nil || device == nil {
-		http.Error(w, "Device not found", http.StatusUnauthorized)
-		return
-	}
-	if device.IsRevoked {
-		http.Error(w, "Device revoked", http.StatusForbidden)
-		return
-	}
-
-	conn, err := s.upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		log.Printf("WebSocket upgrade error: %v", err)
-		return
-	}
-
-	client := s.hub.RegisterClient(conn, session.UserID, session.DeviceID)
-	s.db.UpdateDeviceLastSeen(session.DeviceID)
-	s.db.UpdateUserLastSeen(session.UserID)
-
-	go client.WritePump()
-	go client.ReadPump()
-}
-
-func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	var req struct {
-		Username   string `json:"username"`
-		Password   string `json:"password"`
-		DeviceID   string `json:"device_id"`
-		DeviceName string `json:"device_name"`
-		DeviceType string `json:"device_type"`
-		PublicKey  []byte `json:"public_key"`
-	}
-
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Invalid JSON", http.StatusBadRequest)
-		return
-	}
-
-	if req.Username == "" || req.Password == "" || req.DeviceID == "" {
-		http.Error(w, "Missing required fields", http.StatusBadRequest)
-		return
-	}
-
-	userCount, err := s.db.GetUserCount()
-	if err != nil {
-		http.Error(w, "Internal error", http.StatusInternalServerError)
-		return
-	}
-	if userCount >= s.config.Security.MaxUsers {
-		http.Error(w, "Maximum users reached", http.StatusForbidden)
-		return
-	}
-
-	existing, err := s.db.GetUserByUsername(req.Username)
-	if err != nil {
-		http.Error(w, "Internal error", http.StatusInternalServerError)
-		return
-	}
-	if existing != nil {
-		http.Error(w, "Username already exists", http.StatusConflict)
-		return
-	}
-
-	admin, _ := s.db.GetAdmin()
-	isAdmin := admin == nil
-
-	user, err := s.db.CreateUser(req.Username, req.Password, isAdmin)
-	if err != nil {
-		http.Error(w, "Failed to create user", http.StatusInternalServerError)
-		return
-	}
-
-	if len(req.PublicKey) > 0 {
-		s.db.UpdateUserPublicKey(user.ID, req.PublicKey)
-	}
-
-	device, err := s.db.CreateDevice(user.ID, req.DeviceID, req.DeviceName, req.DeviceType, req.PublicKey)
-	if err != nil {
-		http.Error(w, "Failed to create device", http.StatusInternalServerError)
-		return
-	}
-
-	token, tokenHash := generateSessionToken()
-	_, err = s.db.CreateSession(user.ID, device.DeviceID, tokenHash, 30*24*time.Hour)
-	if err != nil {
-		http.Error(w, "Failed to create session", http.StatusInternalServerError)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"success":     true,
-		"user_id":     user.ID,
-		"device_id":   device.DeviceID,
-		"is_admin":    isAdmin,
-		"token":       token,
-		"server_time": time.Now().Unix(),
-	})
-
-	log.Printf("✅ User registered: %s (admin: %v) [%d/%d]", req.Username, isAdmin, userCount+1, s.config.Security.MaxUsers)
-}
-
-func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	var req struct {
-		Username  string `json:"username"`
-		Password  string `json:"password"`
-		DeviceID  string `json:"device_id"`
-		PublicKey []byte `json:"public_key"`
-	}
-
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Invalid JSON", http.StatusBadRequest)
-		return
-	}
-
-	user, err := s.db.GetUserByUsername(req.Username)
-	if err != nil {
-		http.Error(w, "Internal error", http.StatusInternalServerError)
-		return
-	}
-	if user == nil {
-		http.Error(w, "Invalid credentials", http.StatusUnauthorized)
-		return
-	}
-
-	if s.config.Security.DuressPassword != "" && req.Password == s.config.Security.DuressPassword {
-		log.Printf("🚨 DURESS PASSWORD ENTERED! Triggering emergency wipe")
-		go func() {
-			time.Sleep(500 * time.Millisecond)
-			s.triggerPanic()
-		}()
-		http.Error(w, "Invalid credentials", http.StatusUnauthorized)
-		return
-	}
-
-	isCorrect := false
-	err = bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(req.Password))
-	if err == nil {
-		isCorrect = true
-	} else {
-		// Try fallback to plaintext for migration
-		if user.PasswordHash == req.Password {
-			isCorrect = true
-			// Migrate to bcrypt hash
-			hashedBytes, hashErr := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
-			if hashErr == nil {
-				if updateErr := s.db.UpdateUserPassword(user.ID, string(hashedBytes)); updateErr == nil {
-					log.Printf("ℹ️ Migrated password for user %s to secure hash", user.Username)
-					user.PasswordHash = string(hashedBytes)
-				} else {
-					log.Printf("⚠️ Failed to update migrated password: %v", updateErr)
-				}
-			}
-		}
-	}
-
-	if !isCorrect {
-		http.Error(w, "Invalid credentials", http.StatusUnauthorized)
-		return
-	}
-
-	device, err := s.db.GetDeviceByID(req.DeviceID)
-	if err != nil {
-		http.Error(w, "Internal error", http.StatusInternalServerError)
-		return
-	}
-	if device != nil {
-		if device.UserID != user.ID {
-			http.Error(w, "Device registered under another user", http.StatusForbidden)
-			return
-		}
-		if device.IsRevoked {
-			http.Error(w, "Device revoked", http.StatusForbidden)
-			return
-		}
-	} else {
-		// Create device for this user
-		device, err = s.db.CreateDevice(user.ID, req.DeviceID, "Legacy/Unknown", "unknown", req.PublicKey)
-		if err != nil {
-			http.Error(w, "Failed to register device", http.StatusInternalServerError)
-			return
-		}
-	}
-
-	if len(req.PublicKey) > 0 {
-		s.db.UpdateUserPublicKey(user.ID, req.PublicKey)
-	}
-
-	s.db.UpdateUserLastSeen(user.ID)
-	s.db.UpdateDeviceLastSeen(req.DeviceID)
-
-	partner, _ := s.db.GetPartner(user.ID)
-	var partnerID int64 = 0
-	var partnerUsername string = ""
-	var partnerPublicKey []byte = nil
-	if partner != nil {
-		partnerID = partner.ID
-		partnerUsername = partner.Username
-		partnerPublicKey = partner.PublicKey
-	}
-
-	token, tokenHash := generateSessionToken()
-	_, err = s.db.CreateSession(user.ID, device.DeviceID, tokenHash, 30*24*time.Hour)
-	if err != nil {
-		http.Error(w, "Failed to create session", http.StatusInternalServerError)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"success":            true,
-		"user_id":            user.ID,
-		"is_admin":           user.IsAdmin,
-		"token":              token,
-		"partner_id":         partnerID,
-		"partner_username":   partnerUsername,
-		"partner_public_key": partnerPublicKey,
-		"server_time":        time.Now().Unix(),
-	})
-
-	log.Printf("✅ User logged in: %s", req.Username)
-}
-
-func generateFileID() string {
-	bytes := make([]byte, 16)
-	rand.Read(bytes)
-	return hex.EncodeToString(bytes)
-}
-
-func hashToken(token string) string {
-	sum := sha256.Sum256([]byte(token))
-	return hex.EncodeToString(sum[:])
-}
-
-func generateSessionToken() (string, string) {
-	bytes := make([]byte, 32)
-	if _, err := rand.Read(bytes); err != nil {
-		log.Fatalf("failed to read secure random: %v", err)
-	}
-	token := hex.EncodeToString(bytes)
-	return token, hashToken(token)
-}
-
-func (s *Server) authenticate(r *http.Request) (*models.Session, error) {
-	token := ""
-
-	// 1. Try X-Session-Token header
-	if h := r.Header.Get("X-Session-Token"); h != "" {
-		token = h
-	}
-
-	// 2. Try Authorization Bearer header
-	if token == "" {
-		if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
-			token = strings.TrimPrefix(auth, "Bearer ")
-		}
-	}
-
-	// 3. Try Sec-WebSocket-Protocol header
-	if token == "" {
-		if sub := r.Header.Get("Sec-WebSocket-Protocol"); sub != "" {
-			token = sub
-		}
-	}
-
-	// 4. Try Query parameter
-	if token == "" {
-		token = r.URL.Query().Get("token")
-	}
-
-	if token == "" {
-		return nil, errors.New("missing authentication token")
-	}
-
-	tokenHash := hashToken(token)
-	session, err := s.db.GetSessionByTokenHash(tokenHash)
-	if err != nil {
-		return nil, fmt.Errorf("session lookup error: %w", err)
-	}
-	if session == nil {
-		return nil, errors.New("invalid token")
-	}
-
-	if session.IsRevoked {
-		return nil, errors.New("session revoked")
-	}
-
-	if time.Now().Unix() > session.ExpiresAt {
-		return nil, errors.New("session expired")
-	}
-
-	return session, nil
-}
-
-func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	session, err := s.authenticate(r)
-	if err != nil {
-		http.Error(w, "Unauthorized: "+err.Error(), http.StatusUnauthorized)
-		return
-	}
-
-	if err := s.db.RevokeSession(session.TokenHash); err != nil {
-		http.Error(w, "Internal error", http.StatusInternalServerError)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"success": true,
-	})
-}
-
-func (s *Server) handleFileUpload(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	session, err := s.authenticate(r)
-	if err != nil {
-		http.Error(w, "Unauthorized: "+err.Error(), http.StatusUnauthorized)
-		return
-	}
-
-	r.Body = http.MaxBytesReader(w, r.Body, maxFileSize)
-
-	// Ограничиваем буфер в RAM 32MB, остальное — во временные файлы на диске
-	if err := r.ParseMultipartForm(32 << 20); err != nil {
-		log.Printf("ParseMultipartForm error: %v", err)
-		http.Error(w, "File too large or invalid form", http.StatusBadRequest)
-		return
-	}
-
-	userID := session.UserID
-	user, err := s.db.GetUserByID(userID)
-	if err != nil || user == nil {
-		http.Error(w, "User not found", http.StatusUnauthorized)
-		return
-	}
-
-	fileName := r.FormValue("file_name")
-	mimeType := r.FormValue("mime_type")
-	if mimeType == "" {
-		mimeType = "application/octet-stream"
-	}
-
-	file, _, err := r.FormFile("file")
-	if err != nil {
-		log.Printf("FormFile error: %v", err)
-		http.Error(w, "No file uploaded", http.StatusBadRequest)
-		return
-	}
-	defer file.Close()
-
-	if !utils.HasEnoughSpace(uploadPath, maxFileSize) {
-		http.Error(w, "Insufficient disk space", http.StatusInsufficientStorage)
-		return
-	}
-
-	if err := os.MkdirAll(uploadPath, 0700); err != nil {
-		http.Error(w, "Storage error", http.StatusInternalServerError)
-		return
-	}
-
-	fileID := generateFileID()
-	filePath := filepath.Join(uploadPath, fileID)
-
-	dst, err := os.Create(filePath)
-	if err != nil {
-		log.Printf("Create file error: %v", err)
-		http.Error(w, "Failed to create file", http.StatusInternalServerError)
-		return
-	}
-	defer dst.Close()
-
-	written, err := io.Copy(dst, io.LimitReader(file, maxFileSize))
-	if err != nil {
-		os.Remove(filePath)
-		log.Printf("Copy error: %v", err)
-		http.Error(w, "Upload failed", http.StatusInternalServerError)
-		return
-	}
-
-	err = s.db.CreateFile(fileID, userID, []byte(fileName), written, mimeType, filePath)
-	if err != nil {
-		os.Remove(filePath)
-		log.Printf("DB error: %v", err)
-		http.Error(w, "Database error", http.StatusInternalServerError)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"success": true,
-		"file_id": fileID,
-		"size":    written,
-	})
-
-	log.Printf("📁 File uploaded: %s (%d bytes) by user %d", fileID, written, userID)
-}
-
-func (s *Server) handleFiles(w http.ResponseWriter, r *http.Request) {
-	path := strings.TrimPrefix(r.URL.Path, "/api/files/")
-	parts := strings.Split(path, "/")
-
-	if len(parts) == 0 || parts[0] == "" {
-		http.Error(w, "File ID required", http.StatusBadRequest)
-		return
-	}
-
-	fileID := parts[0]
-
-	if len(parts) == 2 && parts[1] == "info" {
-		s.handleFileInfo(w, r, fileID)
-		return
-	}
-
-	s.handleFileDownload(w, r, fileID)
-}
-
-func (s *Server) handleFileInfo(w http.ResponseWriter, r *http.Request, fileID string) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	session, err := s.authenticate(r)
-	if err != nil {
-		http.Error(w, "Unauthorized: "+err.Error(), http.StatusUnauthorized)
-		return
-	}
-
-	file, err := s.db.GetFileByID(fileID)
-	if err != nil || file == nil {
-		http.Error(w, "File not found", http.StatusNotFound)
-		return
-	}
-
-	if file.IsDeleted {
-		http.Error(w, "File deleted", http.StatusGone)
-		return
-	}
-
-	// Permission check: uploader or partner
-	if file.UploaderID != session.UserID {
-		partner, err := s.db.GetPartner(file.UploaderID)
-		if err != nil {
-			http.Error(w, "Internal error", http.StatusInternalServerError)
-			return
-		}
-		if partner == nil || partner.ID != session.UserID {
-			http.Error(w, "Forbidden", http.StatusForbidden)
-			return
-		}
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"file_id":    file.ID,
-		"file_name":  string(file.FileNameEncrypted),
-		"file_size":  file.FileSize,
-		"mime_type":  file.MimeType,
-		"created_at": file.CreatedAt,
-	})
-}
-
-func (s *Server) handleFileDownload(w http.ResponseWriter, r *http.Request, fileID string) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	session, err := s.authenticate(r)
-	if err != nil {
-		http.Error(w, "Unauthorized: "+err.Error(), http.StatusUnauthorized)
-		return
-	}
-
-	file, err := s.db.GetFileByID(fileID)
-	if err != nil || file == nil {
-		http.Error(w, "File not found", http.StatusNotFound)
-		return
-	}
-
-	if file.IsDeleted {
-		http.Error(w, "File deleted", http.StatusGone)
-		return
-	}
-
-	// Permission check: uploader or partner
-	if file.UploaderID != session.UserID {
-		partner, err := s.db.GetPartner(file.UploaderID)
-		if err != nil {
-			http.Error(w, "Internal error", http.StatusInternalServerError)
-			return
-		}
-		if partner == nil || partner.ID != session.UserID {
-			http.Error(w, "Forbidden", http.StatusForbidden)
-			return
-		}
-	}
-
-	f, err := os.Open(file.StoragePath)
-	if err != nil {
-		http.Error(w, "File not found", http.StatusNotFound)
-		return
-	}
-	defer f.Close()
-
-	stat, err := f.Stat()
-	if err != nil {
-		http.Error(w, "File error", http.StatusInternalServerError)
-		return
-	}
-
-	fileSize := stat.Size()
-
-	w.Header().Set("Content-Type", file.MimeType)
-	w.Header().Set("Accept-Ranges", "bytes")
-
-	rangeHeader := r.Header.Get("Range")
-	if rangeHeader != "" {
-		var start, end int64
-		n, _ := fmt.Sscanf(rangeHeader, "bytes=%d-%d", &start, &end)
-		if n == 1 {
-			end = fileSize - 1
-		}
-
-		if start >= fileSize || end >= fileSize || start > end {
-			http.Error(w, "Invalid range", http.StatusRequestedRangeNotSatisfiable)
-			return
-		}
-
-		f.Seek(start, 0)
-		length := end - start + 1
-
-		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, fileSize))
-		w.Header().Set("Content-Length", strconv.FormatInt(length, 10))
-		w.WriteHeader(http.StatusPartialContent)
-
-		io.CopyN(w, f, length)
-	} else {
-		w.Header().Set("Content-Length", strconv.FormatInt(fileSize, 10))
-		io.Copy(w, f)
-	}
-
-	log.Printf("📥 File downloaded: %s", fileID)
-}
-
-func (s *Server) handleLinkCreate(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	session, err := s.authenticate(r)
-	if err != nil {
-		http.Error(w, "Unauthorized: "+err.Error(), http.StatusUnauthorized)
-		return
-	}
-
-	var req struct {
-		UserID int64 `json:"user_id"`
-	}
-
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Invalid JSON", http.StatusBadRequest)
-		return
-	}
-
-	if req.UserID == 0 {
-		http.Error(w, "Missing user_id", http.StatusBadRequest)
-		return
-	}
-
-	if req.UserID != session.UserID {
-		http.Error(w, "Forbidden", http.StatusForbidden)
-		return
-	}
-
-	user, err := s.db.GetUserByID(req.UserID)
-	if err != nil || user == nil {
-		http.Error(w, "User not found", http.StatusNotFound)
-		return
-	}
-
-	link := s.linkingService.CreateLink(req.UserID)
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"success":     true,
-		"link_code":   link.Code,
-		"expires_at":  link.ExpiresAt.Unix(),
-		"server_time": time.Now().Unix(),
-	})
-
-	log.Printf("🔗 Link code created for user %d: %s", req.UserID, link.Code)
-}
-
-func (s *Server) handleLinkComplete(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	var req struct {
-		LinkCode   string `json:"link_code"`
-		DeviceID   string `json:"device_id"`
-		DeviceName string `json:"device_name"`
-		DeviceType string `json:"device_type"`
-		PublicKey  []byte `json:"public_key"`
-	}
-
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Invalid JSON", http.StatusBadRequest)
-		return
-	}
-
-	if req.LinkCode == "" {
-		http.Error(w, "Missing link_code", http.StatusBadRequest)
-		return
-	}
-
-	link := s.linkingService.GetLink(req.LinkCode)
-	if link == nil {
-		http.Error(w, "Invalid or expired link code", http.StatusBadRequest)
-		return
-	}
-
-	existingDevice, _ := s.db.GetDeviceByID(req.DeviceID)
-	if existingDevice != nil {
-		http.Error(w, "Device already registered", http.StatusConflict)
-		return
-	}
-
-	device, err := s.db.CreateDevice(
-		link.UserID,
-		req.DeviceID,
-		req.DeviceName,
-		req.DeviceType,
-		req.PublicKey,
-	)
-	if err != nil {
-		http.Error(w, "Failed to create device", http.StatusInternalServerError)
-		return
-	}
-
-	token, tokenHash := generateSessionToken()
-	_, err = s.db.CreateSession(link.UserID, device.DeviceID, tokenHash, 30*24*time.Hour)
-	if err != nil {
-		http.Error(w, "Failed to create session", http.StatusInternalServerError)
-		return
-	}
-
-	user, _ := s.db.GetUserByID(link.UserID)
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"success":     true,
-		"user_id":     link.UserID,
-		"username":    user.Username,
-		"device_id":   device.DeviceID,
-		"public_key":  user.PublicKey,
-		"token":       token,
-		"server_time": time.Now().Unix(),
-	})
-
-	log.Printf("🔗 Device linked: %s to user %d (%s)", device.DeviceID, link.UserID, user.Username)
-}
-
-func (s *Server) handleDevicesList(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	session, err := s.authenticate(r)
-	if err != nil {
-		http.Error(w, "Unauthorized: "+err.Error(), http.StatusUnauthorized)
-		return
-	}
-
-	userID := session.UserID
-	devices, err := s.db.GetUserDevices(userID)
-	if err != nil {
-		http.Error(w, "Database error", http.StatusInternalServerError)
-		return
-	}
-
-	deviceList := make([]map[string]interface{}, 0, len(devices))
-	for _, d := range devices {
-		deviceList = append(deviceList, map[string]interface{}{
-			"device_id":   d.DeviceID,
-			"device_name": d.DeviceName,
-			"device_type": d.DeviceType,
-			"created_at":  d.CreatedAt,
-			"last_seen":   d.LastSeen,
-			"is_online":   s.hub.IsDeviceOnline(d.DeviceID),
-		})
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"success":     true,
-		"devices":     deviceList,
-		"server_time": time.Now().Unix(),
-	})
-}
-
-func (s *Server) handleDeviceRevoke(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	session, err := s.authenticate(r)
-	if err != nil {
-		http.Error(w, "Unauthorized: "+err.Error(), http.StatusUnauthorized)
-		return
-	}
-
-	var req struct {
-		UserID   int64  `json:"user_id"`
-		DeviceID string `json:"device_id"`
-	}
-
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Invalid JSON", http.StatusBadRequest)
-		return
-	}
-
-	if req.UserID != session.UserID {
-		http.Error(w, "Forbidden", http.StatusForbidden)
-		return
-	}
-
-	device, err := s.db.GetDeviceByID(req.DeviceID)
-	if err != nil || device == nil {
-		http.Error(w, "Device not found", http.StatusNotFound)
-		return
-	}
-
-	if device.UserID != session.UserID {
-		http.Error(w, "Device does not belong to user", http.StatusForbidden)
-		return
-	}
-
-	if err := s.db.RevokeDevice(req.DeviceID); err != nil {
-		http.Error(w, "Failed to revoke device", http.StatusInternalServerError)
-		return
-	}
-
-	s.hub.DisconnectDevice(req.DeviceID)
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"success":     true,
-		"server_time": time.Now().Unix(),
-	})
-
-	log.Printf("🚫 Device revoked: %s by user %d", req.DeviceID, req.UserID)
-}
-
 func (s *Server) cleanupLoop() {
 	ticker := time.NewTicker(1 * time.Hour)
+	defer ticker.Stop()
 	for range ticker.C {
-		deleted, err := s.db.DeleteExpiredMessages()
-		if err != nil {
-			log.Printf("Error cleaning expired messages: %v", err)
-		} else if deleted > 0 {
-			log.Printf("🧹 Cleaned %d expired messages", deleted)
-		}
+		s.runCleanup()
+	}
+}
 
-		paths, err := s.db.DeleteExpiredFiles()
-		if err != nil {
-			log.Printf("Error cleaning expired files: %v", err)
-		} else {
-			for _, path := range paths {
-				if err := os.Remove(path); err != nil {
-					log.Printf("Error removing file %s: %v", path, err)
-				}
+// runCleanup удаляет истёкшие сообщения, файлы, сессии и брошенные частичные загрузки
+func (s *Server) runCleanup() {
+	deleted, err := s.db.DeleteExpiredMessages()
+	if err != nil {
+		log.Printf("Error cleaning expired messages: %v", err)
+	} else if deleted > 0 {
+		log.Printf("🧹 Cleaned %d expired messages", deleted)
+	}
+
+	paths, err := s.db.DeleteExpiredFiles()
+	if err != nil {
+		log.Printf("Error cleaning expired files: %v", err)
+	} else {
+		for _, path := range paths {
+			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+				log.Printf("Error removing file %s: %v", path, err)
 			}
-			if len(paths) > 0 {
-				log.Printf("🧹 Cleaned %d expired files", len(paths))
+		}
+		if len(paths) > 0 {
+			log.Printf("🧹 Cleaned %d expired files", len(paths))
+		}
+	}
+
+	pruned, err := s.db.PruneSessions(sessionPruneAge)
+	if err != nil {
+		log.Printf("Error pruning sessions: %v", err)
+	} else if pruned > 0 {
+		log.Printf("🧹 Pruned %d stale sessions", pruned)
+	}
+
+	// Частичные загрузки (*.part), брошенные больше часа назад
+	entries, err := os.ReadDir(s.storagePath)
+	if err == nil {
+		cutoff := time.Now().Add(-1 * time.Hour)
+		for _, e := range entries {
+			if e.IsDir() || !strings.HasSuffix(e.Name(), ".part") {
+				continue
+			}
+			info, err := e.Info()
+			if err == nil && info.ModTime().Before(cutoff) {
+				os.Remove(filepath.Join(s.storagePath, e.Name()))
 			}
 		}
 	}
 }
 
+// deadManSwitchLoop — автовайп при длительном отсутствии администратора.
+//
+// Учитывается активность по любому устройству админа (не только логин), а
+// резкий скачок системного времени вперёд между проверками (например, ручная
+// установка даты на Orange Pi без RTC) не приводит к ложному срабатыванию.
 func (s *Server) deadManSwitchLoop() {
-	ticker := time.NewTicker(1 * time.Hour)
+	const interval = 1 * time.Hour
+	log.Printf("💀 Dead Man's Switch: %d days", s.config.DeadMan.TimeoutDays)
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	lastTick := time.Now()
 	for range ticker.C {
-		if time.Now().Year() < 2024 {
+		now := time.Now()
+		jumped := now.Sub(lastTick) > 2*interval
+		lastTick = now
+
+		if now.Year() < 2024 {
 			log.Printf("⚠️ Invalid system time, skipping dead man's switch check")
 			continue
 		}
-
-		admin, err := s.db.GetAdmin()
-		if err != nil || admin == nil {
+		if jumped {
+			log.Printf("⚠️ System clock jumped forward, skipping dead man's switch check this round")
 			continue
 		}
 
-		daysSinceLastSeen := time.Since(time.Unix(admin.LastSeen, 0)).Hours() / 24
-		if daysSinceLastSeen > float64(s.config.DeadMan.TimeoutDays) {
-			log.Printf("💀 Dead Man's Switch triggered! Admin not seen for %.0f days", daysSinceLastSeen)
-			s.triggerPanic()
+		if s.deadManShouldTrigger(now) {
+			s.panicHandler.Trigger("DEAD_MAN_SWITCH")
 		}
 	}
 }
 
-func (s *Server) triggerPanic() {
-	s.panicHandler.Trigger("DEAD_MAN_SWITCH")
+// deadManShouldTrigger проверяет условие срабатывания (вынесено для тестов)
+func (s *Server) deadManShouldTrigger(now time.Time) bool {
+	admin, err := s.db.GetAdmin()
+	if err != nil || admin == nil {
+		return false
+	}
+
+	lastActivity, err := s.db.GetUserLastActivity(admin.ID)
+	if err != nil || lastActivity == 0 {
+		return false
+	}
+
+	daysSince := now.Sub(time.Unix(lastActivity, 0)).Hours() / 24
+	if daysSince > float64(s.config.DeadMan.TimeoutDays) {
+		log.Printf("💀 Dead Man's Switch triggered! Admin not seen for %.0f days", daysSince)
+		return true
+	}
+	return false
 }
 
 func (s *Server) Close() error {
@@ -1185,34 +355,41 @@ func (s *Server) Close() error {
 	return s.db.Close()
 }
 
-func init() {
-	if len(os.Args) > 1 && os.Args[1] == "--init-usb" {
-		initUSB()
-		os.Exit(0)
-	}
-}
-
-func initUSB() {
+func initUSB(explicitPath string) {
 	log.Println("🔧 USB Master Key Setup")
 	log.Println("")
 
-	drives := usb.ListAvailableUSB()
-	if len(drives) == 0 {
-		log.Println("❌ No writable USB drives found!")
-		log.Println("   Insert a USB drive and try again.")
-		return
+	var target string
+	if explicitPath != "" {
+		if !usb.IsWritableDir(explicitPath) {
+			log.Fatalf("❌ %s is not a writable directory", explicitPath)
+		}
+		target = explicitPath
+	} else {
+		drives := usb.ListAvailableUSB()
+		switch len(drives) {
+		case 0:
+			log.Println("❌ No writable USB drives found!")
+			log.Println("   Insert a USB drive and try again, or pass the mount point explicitly:")
+			log.Println("   homelan-server --init-usb --usb /media/user/USB_KEY")
+			os.Exit(1)
+		case 1:
+			target = drives[0]
+		default:
+			log.Println("Several candidate drives found:")
+			for i, drive := range drives {
+				log.Printf("  [%d] %s", i+1, drive)
+			}
+			log.Println("")
+			log.Println("❌ Refusing to guess. Re-run with the exact mount point:")
+			log.Printf("   homelan-server --init-usb --usb %s", drives[0])
+			os.Exit(1)
+		}
 	}
 
-	log.Println("Available USB drives:")
-	for i, drive := range drives {
-		log.Printf("  [%d] %s", i+1, drive)
-	}
-	log.Println("")
+	log.Printf("Creating key on: %s", target)
 
-	selectedDrive := drives[0]
-	log.Printf("Creating key on: %s", selectedDrive)
-
-	masterKey, err := usb.GenerateKeyFile(selectedDrive)
+	masterKey, err := usb.GenerateKeyFile(target)
 	if err != nil {
 		log.Fatalf("❌ Failed to create key: %v", err)
 	}
@@ -1230,10 +407,20 @@ func initUSB() {
 }
 
 func main() {
+	initUSBFlag := flag.Bool("init-usb", false, "create a new USB master key and exit")
+	usbPath := flag.String("usb", "", "mount point of the USB drive for --init-usb")
+	configPath := flag.String("config", "config.yaml", "path to config file")
+	flag.Parse()
+
 	log.Println("=================================")
 	log.Println("   HomeLAN Messenger Server")
-	log.Println("   Version 1.0.0")
+	log.Printf("   Version %s", Version)
 	log.Println("=================================")
+
+	if *initUSBFlag {
+		initUSB(*usbPath)
+		return
+	}
 
 	log.Println("🔑 Looking for USB master key...")
 
@@ -1256,7 +443,7 @@ func main() {
 
 	log.Printf("✅ Master key loaded from: %s", masterKey.KeyPath)
 
-	cfg, err := config.Load("config.yaml")
+	cfg, err := config.Load(*configPath)
 	if err != nil {
 		log.Fatalf("❌ Failed to load config: %v", err)
 	}
@@ -1268,9 +455,8 @@ func main() {
 	defer server.Close()
 
 	log.Println("🔒 Database encrypted with SQLCipher")
-
-	if cfg.DeadMan.Enabled {
-		log.Printf("💀 Dead Man's Switch: %d days", cfg.DeadMan.TimeoutDays)
+	if cfg.Security.DuressPassword != "" {
+		log.Println("🚨 Duress password: enabled")
 	}
 
 	go func() {

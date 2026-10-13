@@ -3,9 +3,12 @@ package db
 import (
 	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -19,22 +22,41 @@ type Database struct {
 	mu   sync.Mutex
 }
 
-// New открывает зашифрованную БД
+// ErrDeviceExists возвращается при попытке создать устройство с уже занятым device_id.
+var ErrDeviceExists = errors.New("device already exists")
+
+// New открывает зашифрованную БД.
+//
+// Все PRAGMA передаются через DSN, а не через conn.Exec: database/sql держит пул
+// соединений, и PRAGMA, выполненная через Exec, применяется только к одному из них.
+// Через DSN драйвер применяет настройки к каждому новому соединению.
 func New(dbPath string, encryptionKey []byte) (*Database, error) {
 	dir := filepath.Dir(dbPath)
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, fmt.Errorf("failed to create db directory: %w", err)
 	}
 
-	// SQLCipher DSN с ключом
 	keyHex := hex.EncodeToString(encryptionKey)
-	dsn := fmt.Sprintf("%s?_pragma_key=x'%s'&_pragma_cipher_page_size=4096", dbPath, keyHex)
+	params := url.Values{}
+	params.Set("_pragma_key", "x'"+keyHex+"'")
+	params.Set("_pragma_cipher_page_size", "4096")
+	params.Set("_busy_timeout", "5000")
+	params.Set("_journal_mode", "WAL")
+	params.Set("_synchronous", "NORMAL")
+	params.Set("_foreign_keys", "1")
+	dsn := dbPath + "?" + params.Encode()
 
 	// Используем драйвер sqlite3 (который предоставляет go-sqlcipher)
 	conn, err := sql.Open("sqlite3", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database: %w", err)
 	}
+
+	// Система рассчитана на 2 пользователей: небольшой пул достаточен,
+	// а лишние соединения только увеличивают шанс SQLITE_BUSY.
+	conn.SetMaxOpenConns(4)
+	conn.SetMaxIdleConns(4)
+	conn.SetConnMaxLifetime(0)
 
 	// Проверяем что ключ правильный
 	if err := conn.Ping(); err != nil {
@@ -50,19 +72,6 @@ func New(dbPath string, encryptionKey []byte) (*Database, error) {
 		return nil, fmt.Errorf("database key verification failed: %w", err)
 	}
 
-	// Настройки производительности
-	_, err = conn.Exec(`
-		PRAGMA journal_mode=WAL;
-		PRAGMA busy_timeout=5000;
-		PRAGMA synchronous=NORMAL;
-		PRAGMA cache_size=-64000;
-		PRAGMA foreign_keys=ON;
-	`)
-	if err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("failed to set pragmas: %w", err)
-	}
-
 	db := &Database{conn: conn}
 
 	if err := db.initSchema(); err != nil {
@@ -71,6 +80,11 @@ func New(dbPath string, encryptionKey []byte) (*Database, error) {
 	}
 
 	return db, nil
+}
+
+// Exec выполняет произвольный SQL (служебные операции и тесты).
+func (db *Database) Exec(query string, args ...interface{}) (sql.Result, error) {
+	return db.conn.Exec(query, args...)
 }
 
 func (db *Database) Close() error {
@@ -163,6 +177,9 @@ func (db *Database) initSchema() error {
 	CREATE INDEX IF NOT EXISTS idx_messages_recipient ON messages(recipient_id);
 	CREATE INDEX IF NOT EXISTS idx_devices_user ON devices(user_id);
 	CREATE INDEX IF NOT EXISTS idx_sessions_token ON sessions(token_hash);
+	CREATE INDEX IF NOT EXISTS idx_sessions_device ON sessions(device_id);
+	CREATE INDEX IF NOT EXISTS idx_files_uploader ON files(uploader_id);
+	CREATE INDEX IF NOT EXISTS idx_message_status_message ON message_status(message_id);
 	`
 
 	_, err := db.conn.Exec(schema)
@@ -293,47 +310,26 @@ func (db *Database) GetAdmin() (*models.User, error) {
 
 // ============ DEVICE METHODS ============
 
-// CreateOrUpdateDevice - создаёт новый девайс или обновляет существующий
-func (db *Database) CreateOrUpdateDevice(userID int64, deviceID, deviceName, deviceType string, publicKey []byte) (*models.Device, error) {
+// CreateDevice создаёт новое устройство. Если device_id уже занят — возвращает
+// ErrDeviceExists. Намеренно НЕ обновляет существующую запись: иначе регистрация
+// с чужим device_id могла бы переназначить устройство другому пользователю и
+// снять с него флаг is_revoked.
+func (db *Database) CreateDevice(userID int64, deviceID, deviceName, deviceType string, publicKey []byte) (*models.Device, error) {
 	now := time.Now().Unix()
 
 	if publicKey == nil {
 		publicKey = []byte{}
 	}
 
-	// Проверяем существует ли девайс
-	existing, err := db.GetDeviceByID(deviceID)
-	if err != nil {
-		return nil, err
-	}
-
-	if existing != nil {
-		// Девайс существует — обновляем
-		_, err := db.conn.Exec(
-			`UPDATE devices SET user_id = ?, device_name = ?, device_type = ?, public_key = ?, last_seen = ?, is_revoked = 0
-			 WHERE device_id = ?`,
-			userID, deviceName, deviceType, publicKey, now, deviceID,
-		)
-		if err != nil {
-			return nil, err
-		}
-
-		existing.UserID = userID
-		existing.DeviceName = deviceName
-		existing.DeviceType = deviceType
-		existing.PublicKey = publicKey
-		existing.LastSeen = now
-		existing.IsRevoked = false
-		return existing, nil
-	}
-
-	// Девайс не существует — создаём новый
 	result, err := db.conn.Exec(
 		`INSERT INTO devices (user_id, device_id, device_name, device_type, public_key, created_at, last_seen, is_revoked)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, 0)`,
 		userID, deviceID, deviceName, deviceType, publicKey, now, now,
 	)
 	if err != nil {
+		if isUniqueViolation(err) {
+			return nil, ErrDeviceExists
+		}
 		return nil, err
 	}
 
@@ -351,9 +347,14 @@ func (db *Database) CreateOrUpdateDevice(userID int64, deviceID, deviceName, dev
 	}, nil
 }
 
-// CreateDevice - оставляем для совместимости, но теперь вызывает CreateOrUpdateDevice
-func (db *Database) CreateDevice(userID int64, deviceID, deviceName, deviceType string, publicKey []byte) (*models.Device, error) {
-	return db.CreateOrUpdateDevice(userID, deviceID, deviceName, deviceType, publicKey)
+// isUniqueViolation распознаёт нарушение UNIQUE/PRIMARY KEY по тексту ошибки SQLite.
+// Типизированные коды go-sqlcipher намеренно не используются: пакет требует cgo,
+// а строковая проверка позволяет `go vet` для других платформ без C-компилятора.
+func isUniqueViolation(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "UNIQUE constraint failed")
 }
 
 func (db *Database) GetDeviceByID(deviceID string) (*models.Device, error) {
@@ -413,12 +414,44 @@ func (db *Database) UpdateDeviceLastSeen(deviceID string) error {
 	return err
 }
 
+// RevokeDevice помечает устройство отозванным и одновременно инвалидирует все
+// его сессии. Без второго шага отозванное устройство продолжало бы ходить в REST API
+// по старому токену (в том числе создавать коды привязки новых устройств).
 func (db *Database) RevokeDevice(deviceID string) error {
-	_, err := db.conn.Exec(
-		`UPDATE devices SET is_revoked = 1 WHERE device_id = ?`,
-		deviceID,
-	)
-	return err
+	tx, err := db.conn.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(`UPDATE devices SET is_revoked = 1 WHERE device_id = ?`, deviceID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`UPDATE sessions SET is_revoked = 1 WHERE device_id = ?`, deviceID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// GetUserLastActivity возвращает самую позднюю активность пользователя по любому
+// из его устройств (используется Dead Man's Switch).
+func (db *Database) GetUserLastActivity(userID int64) (int64, error) {
+	var last sql.NullInt64
+	err := db.conn.QueryRow(
+		`SELECT MAX(ts) FROM (
+			SELECT last_seen AS ts FROM users WHERE id = ?
+			UNION ALL
+			SELECT last_seen AS ts FROM devices WHERE user_id = ? AND is_revoked = 0
+		)`,
+		userID, userID,
+	).Scan(&last)
+	if err != nil {
+		return 0, err
+	}
+	if !last.Valid {
+		return 0, nil
+	}
+	return last.Int64, nil
 }
 
 // ============ MESSAGE METHODS ============
@@ -479,14 +512,15 @@ func (db *Database) CreateMessage(senderID, recipientID int64, encryptedContent 
 	}, nil
 }
 
-// GetMessagesSince - получает сообщения для юзера с фильтрацией (вперёд)
+// GetMessagesSince - получает сообщения для юзера (вперёд, для синхронизации).
+// Удалённые сообщения отдаются как tombstone (is_deleted = 1, пустое содержимое),
+// чтобы устройство, бывшее офлайн в момент удаления, тоже убрало их у себя.
 func (db *Database) GetMessagesSince(userID int64, sinceSeqID int64, limit int) ([]*models.Message, error) {
 	rows, err := db.conn.Query(
 		`SELECT id, seq_id, sender_id, recipient_id, encrypted_content, content_type, file_id, created_at, expires_at, is_deleted, deleted_at
 		 FROM messages 
 		 WHERE (sender_id = ? OR recipient_id = ?) 
 		   AND seq_id > ? 
-		   AND is_deleted = 0
 		 ORDER BY seq_id ASC
 		 LIMIT ?`,
 		userID, userID, sinceSeqID, limit,
@@ -687,6 +721,9 @@ func (db *Database) UpdateSyncCursor(deviceID string, lastSeqID int64) error {
 // ============ FILE METHODS ============
 
 func (db *Database) CreateFile(fileID string, uploaderID int64, fileNameEncrypted []byte, fileSize int64, mimeType, storagePath string) error {
+	if fileNameEncrypted == nil {
+		fileNameEncrypted = []byte{} // колонка NOT NULL; имя файла в открытом виде не храним
+	}
 	now := time.Now().Unix()
 	expiresAt := now + int64(30*24*60*60) // 30 дней
 
@@ -749,9 +786,15 @@ func (db *Database) DeleteExpiredFiles() ([]string, error) {
 	var paths []string
 	for rows.Next() {
 		var path string
-		rows.Scan(&path)
+		if err := rows.Scan(&path); err != nil {
+			return nil, err
+		}
 		paths = append(paths, path)
 	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	rows.Close()
 
 	_, err = db.conn.Exec(
 		`UPDATE files SET is_deleted = 1 
@@ -760,6 +803,19 @@ func (db *Database) DeleteExpiredFiles() ([]string, error) {
 	)
 
 	return paths, err
+}
+
+// GetStorageUsed возвращает суммарный размер неудалённых файлов (для квоты хранилища).
+func (db *Database) GetStorageUsed() (int64, error) {
+	var used sql.NullInt64
+	err := db.conn.QueryRow(`SELECT SUM(file_size) FROM files WHERE is_deleted = 0`).Scan(&used)
+	if err != nil {
+		return 0, err
+	}
+	if !used.Valid {
+		return 0, nil
+	}
+	return used.Int64, nil
 }
 
 // GetUserCount возвращает количество пользователей
@@ -857,15 +913,22 @@ func (db *Database) CreateSession(userID int64, deviceID, tokenHash string, dura
 	}, nil
 }
 
+// GetSessionByTokenHash возвращает сессию вместе со статусом её устройства.
+// Session.DeviceRevoked = true означает, что устройство отозвано (или удалено) —
+// такая сессия должна считаться недействительной.
 func (db *Database) GetSessionByTokenHash(tokenHash string) (*models.Session, error) {
 	var s models.Session
 	var isRevoked int
+	var deviceRevoked sql.NullInt64
 
 	err := db.conn.QueryRow(
-		`SELECT id, token_hash, user_id, device_id, created_at, expires_at, is_revoked
-		 FROM sessions WHERE token_hash = ?`,
+		`SELECT s.id, s.token_hash, s.user_id, s.device_id, s.created_at, s.expires_at, s.is_revoked,
+		        d.is_revoked
+		 FROM sessions s
+		 LEFT JOIN devices d ON d.device_id = s.device_id
+		 WHERE s.token_hash = ?`,
 		tokenHash,
-	).Scan(&s.ID, &s.TokenHash, &s.UserID, &s.DeviceID, &s.CreatedAt, &s.ExpiresAt, &isRevoked)
+	).Scan(&s.ID, &s.TokenHash, &s.UserID, &s.DeviceID, &s.CreatedAt, &s.ExpiresAt, &isRevoked, &deviceRevoked)
 
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -875,7 +938,32 @@ func (db *Database) GetSessionByTokenHash(tokenHash string) (*models.Session, er
 	}
 
 	s.IsRevoked = isRevoked == 1
+	// Устройства нет в таблице (NULL) — тоже считаем недействительным.
+	s.DeviceRevoked = !deviceRevoked.Valid || deviceRevoked.Int64 == 1
 	return &s, nil
+}
+
+// ExtendSession продлевает срок действия сессии (sliding expiration).
+func (db *Database) ExtendSession(tokenHash string, duration time.Duration) (int64, error) {
+	expiresAt := time.Now().Unix() + int64(duration.Seconds())
+	_, err := db.conn.Exec(
+		`UPDATE sessions SET expires_at = ? WHERE token_hash = ? AND is_revoked = 0`,
+		expiresAt, tokenHash,
+	)
+	return expiresAt, err
+}
+
+// PruneSessions удаляет давно истёкшие и отозванные сессии.
+func (db *Database) PruneSessions(olderThan time.Duration) (int64, error) {
+	cutoff := time.Now().Add(-olderThan).Unix()
+	result, err := db.conn.Exec(
+		`DELETE FROM sessions WHERE expires_at < ? OR (is_revoked = 1 AND created_at <= ?)`,
+		cutoff, cutoff,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 func (db *Database) RevokeSession(tokenHash string) error {

@@ -1,6 +1,10 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import '../providers/providers.dart';
+import '../services/server_config.dart';
+import '../utils/app_info.dart';
+import '../utils/server_url.dart';
+import '../widgets/server_address_dialog.dart';
 import 'login_screen.dart';
 import 'devices_screen.dart';
 
@@ -125,7 +129,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Text(
-              'Версия 0.9.0',
+              'Версия $appVersion',
               style: TextStyle(color: Colors.grey[300], fontSize: 16),
             ),
             const SizedBox(height: 16),
@@ -403,6 +407,32 @@ class _SettingsScreenState extends State<SettingsScreen> {
               ),
             ),
           ),
+          const SizedBox(height: 8),
+
+          // Адрес сервера
+          Container(
+            margin: const EdgeInsets.symmetric(horizontal: 16),
+            decoration: BoxDecoration(
+              color: Colors.grey[850],
+              borderRadius: BorderRadius.circular(12),
+            ),
+            child: ValueListenableBuilder<String>(
+              valueListenable: ServerConfig().url,
+              builder: (context, url, _) => ListTile(
+                leading: Icon(Icons.dns, color: Colors.grey[400]),
+                title: const Text(
+                  'Адрес сервера',
+                  style: TextStyle(color: Colors.white),
+                ),
+                subtitle: Text(
+                  displayServerUrl(url),
+                  style: TextStyle(color: Colors.grey[500], fontSize: 12),
+                ),
+                trailing: Icon(Icons.edit, color: Colors.grey[500], size: 18),
+                onTap: () => ServerAddressDialog.show(context),
+              ),
+            ),
+          ),
           
           const SizedBox(height: 24),
 
@@ -502,7 +532,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     style: TextStyle(color: Colors.orange),
                   ),
                   subtitle: Text(
-                    'Сохранить локальные данные',
+                    'Завершить сессию. Ключи и история остаются на устройстве',
                     style: TextStyle(color: Colors.grey[500], fontSize: 12),
                   ),
                   onTap: () => _showLogoutDialog(context, auth),
@@ -559,7 +589,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
           ListTile(
             leading: Icon(Icons.info_outline, color: Colors.grey[400]),
             title: const Text('О приложении', style: TextStyle(color: Colors.white)),
-            subtitle: Text('Версия 0.9.0', style: TextStyle(color: Colors.grey[500])),
+            subtitle: Text('Версия $appVersion', style: TextStyle(color: Colors.grey[500])),
             onTap: _showAboutDialog,
           ),
           
@@ -576,7 +606,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
         backgroundColor: Colors.grey[850],
         title: const Text('Выход', style: TextStyle(color: Colors.white)),
         content: const Text(
-          'Вы уверены что хотите выйти?\n\nЛокальные сообщения будут сохранены.',
+          'Вы уверены что хотите выйти?\n\nСессия на сервере будет завершена. '
+          'Ключи шифрования и локальные сообщения сохранятся — после повторного '
+          'входа история останется читаемой.',
           style: TextStyle(color: Colors.white),
         ),
         actions: [

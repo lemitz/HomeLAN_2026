@@ -2,6 +2,9 @@
 
 import 'package:flutter/material.dart';
 import '../services/connection_service.dart';
+import '../services/server_config.dart';
+import '../utils/server_url.dart';
+import '../widgets/server_address_dialog.dart';
 
 class ServerGuardScreen extends StatefulWidget {
   final Widget child;
@@ -20,6 +23,11 @@ class _ServerGuardScreenState extends State<ServerGuardScreen> {
   void initState() {
     super.initState();
     _conn.addListener(_onStateChanged);
+    // Мониторинг запускаем здесь: guard показывает child только при
+    // подключении, поэтому ждать запуска из child нельзя.
+    if (!_conn.isMonitoring) {
+      WidgetsBinding.instance.addPostFrameCallback((_) => _conn.startMonitoring());
+    }
   }
 
   @override
@@ -37,6 +45,13 @@ class _ServerGuardScreenState extends State<ServerGuardScreen> {
     setState(() => _isRetrying = true);
     await _conn.tryReconnect();
     if (mounted) setState(() => _isRetrying = false);
+  }
+
+  Future<void> _changeServer() async {
+    final changed = await ServerAddressDialog.show(context);
+    if (changed && mounted) {
+      await _retry();
+    }
   }
 
   @override
@@ -85,10 +100,18 @@ class _ServerGuardScreenState extends State<ServerGuardScreen> {
                     style: TextStyle(fontSize: 14, color: Colors.grey[500]),
                   ),
                 ),
-              const SizedBox(height: 48),
+              const SizedBox(height: 8),
+              ValueListenableBuilder<String>(
+                valueListenable: ServerConfig().url,
+                builder: (_, url, __) => Text(
+                  displayServerUrl(url),
+                  style: TextStyle(fontSize: 13, color: Colors.grey[600]),
+                ),
+              ),
+              const SizedBox(height: 40),
               if (_conn.state == ServerConnectionState.checking || _isRetrying)
                 const CircularProgressIndicator()
-              else if (_conn.isDisconnected)
+              else if (_conn.isDisconnected) ...[
                 ElevatedButton.icon(
                   onPressed: _retry,
                   icon: const Icon(Icons.refresh),
@@ -97,6 +120,13 @@ class _ServerGuardScreenState extends State<ServerGuardScreen> {
                     padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 16),
                   ),
                 ),
+                const SizedBox(height: 12),
+                TextButton.icon(
+                  onPressed: _changeServer,
+                  icon: const Icon(Icons.dns, size: 18),
+                  label: const Text('Изменить адрес сервера'),
+                ),
+              ],
             ],
           ),
         ),

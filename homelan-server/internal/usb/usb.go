@@ -6,7 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec" // Добавлено
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -63,18 +63,39 @@ func FindMasterKey() (*MasterKey, error) {
 	return nil, ErrNoUSBFound
 }
 
-// GenerateKeyFile создаёт новый ключ на указанном USB
+// ErrKeyExists возвращается, если на накопителе уже есть homelan.key:
+// перезапись уничтожила бы единственный ключ от существующей БД.
+var ErrKeyExists = errors.New("homelan.key already exists on this drive")
+
+// GenerateKeyFile создаёт новый ключ на указанном USB. Существующий ключ не перезаписывается.
 func GenerateKeyFile(usbPath string) (*MasterKey, error) {
+	keyPath := filepath.Join(usbPath, KeyFileName)
+	if _, err := os.Stat(keyPath); err == nil {
+		return nil, fmt.Errorf("%w: %s", ErrKeyExists, keyPath)
+	}
+
 	key := make([]byte, KeySize)
 	if _, err := rand.Read(key); err != nil {
 		return nil, fmt.Errorf("failed to generate random key: %w", err)
 	}
 
-	keyPath := filepath.Join(usbPath, KeyFileName)
 	keyHex := hex.EncodeToString(key)
 
-	if err := os.WriteFile(keyPath, []byte(keyHex+"\n"), 0600); err != nil {
+	// O_EXCL: не перезаписывать, если файл появился между Stat и созданием
+	f, err := os.OpenFile(keyPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create key file: %w", err)
+	}
+	if _, err := f.Write([]byte(keyHex + "\n")); err != nil {
+		f.Close()
 		return nil, fmt.Errorf("failed to write key file: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("failed to sync key file: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return nil, fmt.Errorf("failed to close key file: %w", err)
 	}
 
 	return &MasterKey{
@@ -90,14 +111,26 @@ func ListAvailableUSB() []string {
 	drives := getMountedDrives()
 
 	for _, drive := range drives {
-		testFile := filepath.Join(drive, ".homelan_write_test")
-		if err := os.WriteFile(testFile, []byte("test"), 0600); err == nil {
-			os.Remove(testFile)
+		if IsWritableDir(drive) {
 			usable = append(usable, drive)
 		}
 	}
 
 	return usable
+}
+
+// IsWritableDir проверяет, что директория существует и в неё можно писать
+func IsWritableDir(dir string) bool {
+	info, err := os.Stat(dir)
+	if err != nil || !info.IsDir() {
+		return false
+	}
+	testFile := filepath.Join(dir, ".homelan_write_test")
+	if err := os.WriteFile(testFile, []byte("test"), 0600); err != nil {
+		return false
+	}
+	os.Remove(testFile)
+	return true
 }
 
 func getMountedDrives() []string {

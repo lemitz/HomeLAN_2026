@@ -1,6 +1,7 @@
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import '../utils/app_log.dart';
 
 class NotificationService {
   static final NotificationService _instance = NotificationService._internal();
@@ -46,7 +47,7 @@ class NotificationService {
     await _createNotificationChannel();
 
     _isInitialized = true;
-    print('🔔 NotificationService initialized');
+    appLog('🔔 NotificationService initialized');
   }
 
   Future<void> _requestPermissions() async {
@@ -76,14 +77,14 @@ class NotificationService {
   }
 
   void _onNotificationTap(NotificationResponse response) {
-    print('🔔 Notification tapped: ${response.payload}');
+    appLog('🔔 Notification tapped: ${response.payload}');
     
     if (response.payload != null) {
       try {
         final userId = int.tryParse(response.payload!);
         onNotificationTap?.call(userId);
       } catch (e) {
-        print('Error parsing notification payload: $e');
+        appLog('Error parsing notification payload: $e');
       }
     }
   }
@@ -149,7 +150,7 @@ class NotificationService {
       payload: senderId.toString(),
     );
 
-    print('🔔 Notification shown: $senderName - $body');
+    appLog('🔔 Notification shown: $senderName - $body');
   }
 
   /// Убрать уведомления от конкретного юзера (когда открыли чат)

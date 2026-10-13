@@ -40,3 +40,13 @@ client/.flutter-plugins
 client/.flutter-plugins-dependencies
 client/build/
 client/pubspec.lock
+client/android/key.properties
+client/android/**/*.jks
+client/android/**/*.keystore
+client/android/local.properties
+client/android/.gradle/
+client/windows/flutter/ephemeral/
+
+# Server runtime artifacts
+homelan-server/*.log
+homelan-server/uploads/

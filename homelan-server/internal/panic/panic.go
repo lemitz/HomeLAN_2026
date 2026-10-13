@@ -2,13 +2,23 @@ package panic
 
 import (
 	"crypto/rand"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
-	"syscall"
+	"sync"
 )
 
-// Closer интерфейс нужен, чтобы принять и *sql.DB, и твою обертку *db.Database
+const (
+	// Размер блока при перезаписи файла случайными данными
+	overwriteChunk = 1 << 20 // 1 MiB
+
+	// Для вложений достаточно уничтожить начало файла: содержимое зашифровано
+	// ключами клиентов, которых у сервера никогда не было.
+	attachmentHeaderSize = 4096
+)
+
+// Closer интерфейс нужен, чтобы принять и *sql.DB, и обертку *db.Database
 type Closer interface {
 	Close() error
 }
@@ -18,9 +28,10 @@ type PanicHandler struct {
 	dbPath     string
 	filesPath  string
 	onComplete func()
+	once       sync.Once
 }
 
-// New теперь принимает dbConn (интерфейс с методом Close)
+// New создаёт обработчик экстренного уничтожения данных
 func New(dbConn Closer, dbPath, filesPath string, onComplete func()) *PanicHandler {
 	return &PanicHandler{
 		dbConn:     dbConn,
@@ -30,12 +41,17 @@ func New(dbConn Closer, dbPath, filesPath string, onComplete func()) *PanicHandl
 	}
 }
 
-// Trigger запускает экстренное уничтожение данных
+// Trigger запускает экстренное уничтожение данных. Повторные вызовы (например,
+// одновременно от USB-монитора и duress-пароля) игнорируются — вайп выполняется
+// ровно один раз.
 func (p *PanicHandler) Trigger(reason string) {
+	p.once.Do(func() { p.run(reason) })
+}
+
+func (p *PanicHandler) run(reason string) {
 	log.Printf("🚨 PANIC TRIGGERED: %s", reason)
 
-	// 0. ВАЖНО: Закрываем соединение с БД
-	// Это снимает файловые блокировки и позволяет корректно удалить WAL
+	// 0. Закрываем соединение с БД: снимает файловые блокировки и даёт корректно удалить WAL
 	if p.dbConn != nil {
 		if err := p.dbConn.Close(); err != nil {
 			log.Printf("⚠️ Error closing DB: %v", err)
@@ -44,19 +60,25 @@ func (p *PanicHandler) Trigger(reason string) {
 		}
 	}
 
-	// 1. Удаляем WAL и SHM (там могут быть незашифрованные данные)
+	// 1. WAL содержит последние страницы БД — затираем целиком, SHM (индекс) просто удаляем
+	if err := overwriteFile(p.dbPath+"-wal", 0); err != nil && !os.IsNotExist(err) {
+		log.Printf("⚠️ Failed to overwrite WAL: %v", err)
+	}
 	os.Remove(p.dbPath + "-wal")
 	os.Remove(p.dbPath + "-shm")
 	log.Println("🗑️ WAL/SHM removed")
 
-	// 2. Перезаписываем заголовок БД (первые 4KB = SQLCipher header)
-	if err := p.overwriteFileHeader(p.dbPath, 4096); err != nil {
-		log.Printf("⚠️ Failed to overwrite DB header: %v", err)
+	// 2. Перезаписываем БД ЦЕЛИКОМ. Сервер открывает SQLCipher raw-ключом (x'…'),
+	//    при котором ключ шифрования не зависит от salt в заголовке, поэтому
+	//    затирания одного заголовка недостаточно: обладатель USB-ключа смог бы
+	//    прочитать остальные страницы. БД для 2 пользователей небольшая.
+	if err := overwriteFile(p.dbPath, 0); err != nil {
+		log.Printf("⚠️ Failed to overwrite DB: %v", err)
 	} else {
-		log.Println("🗑️ Database header destroyed")
+		log.Println("🗑️ Database content destroyed")
 	}
 
-	// 3. Удаляем все файлы
+	// 3. Удаляем все файлы вложений
 	if err := p.secureDeleteDir(p.filesPath); err != nil {
 		log.Printf("⚠️ Failed to delete files: %v", err)
 	} else {
@@ -67,8 +89,8 @@ func (p *PanicHandler) Trigger(reason string) {
 	os.Remove(p.dbPath)
 	log.Println("🗑️ Database removed")
 
-	// 5. ВАЖНО: Сбрасываем буферы файловой системы на диск (для SD-карты)
-	syscall.Sync()
+	// 5. Сбрасываем буферы файловой системы на диск (важно для SD-карты)
+	syncFilesystem()
 	log.Println("💾 Filesystem synced (buffers flushed)")
 
 	log.Println("🚨 PANIC WIPE COMPLETE")
@@ -79,36 +101,58 @@ func (p *PanicHandler) Trigger(reason string) {
 	}
 }
 
-// overwriteFileHeader перезаписывает начало файла случайными данными
-func (p *PanicHandler) overwriteFileHeader(path string, size int) error {
+// overwriteFile перезаписывает файл случайными данными и делает fsync.
+// limit > 0 ограничивает объём перезаписи первыми limit байтами; 0 — весь файл.
+func overwriteFile(path string, limit int64) error {
 	f, err := os.OpenFile(path, os.O_WRONLY, 0)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
 
-	garbage := make([]byte, size)
-	rand.Read(garbage)
-
-	_, err = f.Write(garbage)
+	info, err := f.Stat()
 	if err != nil {
 		return err
+	}
+
+	remaining := info.Size()
+	if limit > 0 && remaining > limit {
+		remaining = limit
+	}
+
+	buf := make([]byte, overwriteChunk)
+	for remaining > 0 {
+		n := int64(len(buf))
+		if remaining < n {
+			n = remaining
+		}
+		if _, err := io.ReadFull(rand.Reader, buf[:n]); err != nil {
+			return err
+		}
+		if _, err := f.Write(buf[:n]); err != nil {
+			return err
+		}
+		remaining -= n
 	}
 
 	// Принудительно пишем изменения этого конкретного файла на диск
 	return f.Sync()
 }
 
-// secureDeleteDir удаляет директорию с перезаписью файлов
+// secureDeleteDir удаляет все файлы в директории, предварительно затирая их начало
 func (p *PanicHandler) secureDeleteDir(dir string) error {
+	if dir == "" {
+		return nil
+	}
 	return filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return nil // игнорируем ошибки, продолжаем
 		}
 
 		if !info.IsDir() {
-			// Перезаписываем первые 4KB каждого файла
-			p.overwriteFileHeader(path, 4096)
+			if err := overwriteFile(path, attachmentHeaderSize); err != nil {
+				log.Printf("⚠️ overwrite %s: %v", path, err)
+			}
 			os.Remove(path)
 		}
 

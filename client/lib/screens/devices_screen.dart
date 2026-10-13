@@ -186,7 +186,8 @@ class _DevicesScreenState extends State<DevicesScreen> {
                       itemCount: _devices.length,
                       itemBuilder: (context, index) {
                         final device = _devices[index];
-                        final isCurrentDevice = device['device_id'] == currentDeviceId;
+                        final isCurrentDevice = device['is_current'] == true ||
+                            device['device_id'] == currentDeviceId;
                         final isOnline = device['is_online'] == true;
 
                         return ListTile(

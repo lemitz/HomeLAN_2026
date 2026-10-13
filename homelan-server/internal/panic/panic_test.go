@@ -1,27 +1,23 @@
 package panic
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"testing"
 )
 
 type MockCloser struct {
-	closed bool
+	closed int
 }
 
 func (m *MockCloser) Close() error {
-	m.closed = true
+	m.closed++
 	return nil
 }
 
 func TestPanicHandler(t *testing.T) {
-	// Create temporary directories
-	tempDir, err := os.MkdirTemp("", "homelan_panic_test")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(tempDir)
+	tempDir := t.TempDir()
 
 	dbPath := filepath.Join(tempDir, "messages.db")
 	filesDir := filepath.Join(tempDir, "files")
@@ -30,8 +26,7 @@ func TestPanicHandler(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Create dummy DB file, WAL, SHM
-	if err := os.WriteFile(dbPath, []byte("database_content_here_and_it_should_be_long_long_long_long_long_long"), 0600); err != nil {
+	if err := os.WriteFile(dbPath, bytes.Repeat([]byte("database_content_"), 1000), 0600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(dbPath+"-wal", []byte("wal_content"), 0600); err != nil {
@@ -41,42 +36,86 @@ func TestPanicHandler(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Create dummy file attachment
 	dummyFilePath := filepath.Join(filesDir, "file1")
 	if err := os.WriteFile(dummyFilePath, []byte("attachment_content_here"), 0600); err != nil {
 		t.Fatal(err)
 	}
 
 	mockCloser := &MockCloser{}
-	completed := false
+	completed := 0
 
 	handler := New(mockCloser, dbPath, filesDir, func() {
-		completed = true
+		completed++
 	})
 
 	handler.Trigger("TEST_PANIC")
+	// Повторный вызов должен быть проигнорирован (sync.Once)
+	handler.Trigger("TEST_PANIC_AGAIN")
 
-	// 1. Verify DB closer was closed
-	if !mockCloser.closed {
-		t.Error("expected DB closer to be closed")
-	}
-
-	// 2. Verify files deleted
-	if _, err := os.Stat(dbPath); !os.IsNotExist(err) {
-		t.Error("expected DB file to be deleted")
-	}
-	if _, err := os.Stat(dbPath + "-wal"); !os.IsNotExist(err) {
-		t.Error("expected WAL to be deleted")
-	}
-	if _, err := os.Stat(dbPath + "-shm"); !os.IsNotExist(err) {
-		t.Error("expected SHM to be deleted")
-	}
-	if _, err := os.Stat(dummyFilePath); !os.IsNotExist(err) {
-		t.Error("expected dummy file attachment to be deleted")
+	if mockCloser.closed != 1 {
+		t.Errorf("expected DB closer to be closed exactly once, got %d", mockCloser.closed)
 	}
 
-	// 3. Verify callback ran
-	if !completed {
-		t.Error("expected callback to run")
+	for _, p := range []string{dbPath, dbPath + "-wal", dbPath + "-shm", dummyFilePath} {
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Errorf("expected %s to be deleted", p)
+		}
 	}
+
+	if completed != 1 {
+		t.Errorf("expected callback to run exactly once, got %d", completed)
+	}
+}
+
+func TestOverwriteFileFull(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "db")
+
+	original := bytes.Repeat([]byte("SECRET-PAGE-"), 3*overwriteChunk/12) // > 1 chunk
+	if err := os.WriteFile(path, original, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := overwriteFile(path, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after) != len(original) {
+		t.Fatalf("size changed: %d -> %d", len(original), len(after))
+	}
+	if bytes.Contains(after, []byte("SECRET-PAGE-")) {
+		t.Error("original content still present after full overwrite")
+	}
+}
+
+func TestOverwriteFileLimit(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "att")
+
+	original := bytes.Repeat([]byte("A"), 10000)
+	if err := os.WriteFile(path, original, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := overwriteFile(path, 4096); err != nil {
+		t.Fatal(err)
+	}
+
+	after, _ := os.ReadFile(path)
+	if bytes.Equal(after[:4096], original[:4096]) {
+		t.Error("header not overwritten")
+	}
+	if !bytes.Equal(after[4096:], original[4096:]) {
+		t.Error("tail must stay intact when limit is set")
+	}
+}
+
+func TestMissingFilesDoNotPanic(t *testing.T) {
+	dir := t.TempDir()
+	handler := New(nil, filepath.Join(dir, "nope.db"), filepath.Join(dir, "nofiles"), nil)
+	handler.Trigger("MISSING")
 }
