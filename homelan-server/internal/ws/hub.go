@@ -1,3 +1,4 @@
+// Package ws — WebSocket-канал HomeLAN (протокол v2, см. docs/ARCHITECTURE.md).
 package ws
 
 import (
@@ -8,177 +9,122 @@ import (
 
 	"github.com/gorilla/websocket"
 	"homelan-server/internal/db"
+	"homelan-server/internal/models"
 )
 
 const (
-	// Время ожидания записи
-	writeWait = 10 * time.Second
-
-	// Время между пингами
-	pingPeriod = 30 * time.Second
-
-	// Максимальный размер сообщения (1MB)
-	maxMessageSize = 1024 * 1024
+	writeWait      = 10 * time.Second
+	pongWait       = 60 * time.Second
+	pingPeriod     = 30 * time.Second
+	maxMessageSize = 256 * 1024 // входящий кадр
+	sendBuffer     = 512
 )
 
-// Client - подключённый клиент
-type Client struct {
-	hub      *Hub
-	conn     *websocket.Conn
-	send     chan []byte
-	userID   int64
-	deviceID string
-	mu       sync.Mutex
-}
-
-// Hub - управляет всеми WebSocket подключениями
+// Hub хранит активные подключения (одно на устройство).
 type Hub struct {
-	db         *db.Database
-	clients    map[string]*Client // deviceID -> Client
-	register   chan *Client
-	unregister chan *Client
-	broadcast  chan *BroadcastMessage
-	mu         sync.RWMutex
+	db      *db.Database
+	mu      sync.RWMutex
+	clients map[string]*Client // deviceID -> Client
+
+	// OnActivity вызывается на каждое входящее сообщение (для last_seen).
+	OnActivity func(userID int64, deviceID string)
+	// OnFileReleased вызывается, когда файл больше не нужен (сообщение удалено).
+	OnFileReleased func(fileID string)
 }
 
-// BroadcastMessage - сообщение для отправки
-type BroadcastMessage struct {
-	RecipientID   int64 // 0 = всем
-	Data          []byte
-	ExcludeDevice string // не отправлять этому устройству
-}
-
-// WSMessage - формат WebSocket сообщения
-type WSMessage struct {
-	Type string          `json:"type"`
-	Data json.RawMessage `json:"data"`
-}
-
-// NewHub создаёт новый хаб
 func NewHub(database *db.Database) *Hub {
-	return &Hub{
-		db:         database,
-		clients:    make(map[string]*Client),
-		register:   make(chan *Client),
-		unregister: make(chan *Client),
-		broadcast:  make(chan *BroadcastMessage, 256),
-	}
+	return &Hub{db: database, clients: make(map[string]*Client)}
 }
 
-// Run запускает главный цикл хаба
-func (h *Hub) Run() {
-	for {
-		select {
-		case client := <-h.register:
-			h.mu.Lock()
-			if existing, ok := h.clients[client.deviceID]; ok && existing != client {
-				close(existing.send)
-			}
-			h.clients[client.deviceID] = client
-			h.mu.Unlock()
-			log.Printf("📱 Client connected: device=%s user=%d", client.deviceID, client.userID)
+// Client — одно WebSocket-подключение устройства.
+type Client struct {
+	hub       *Hub
+	conn      *websocket.Conn
+	send      chan []byte
+	done      chan struct{}
+	closeOnce sync.Once
+	userID    int64
+	deviceID  string
+}
 
-		case client := <-h.unregister:
-			h.mu.Lock()
-			if existing, ok := h.clients[client.deviceID]; ok && existing == client {
-				delete(h.clients, client.deviceID)
-				close(client.send)
-			}
-			h.mu.Unlock()
-			log.Printf("📴 Client disconnected: device=%s", client.deviceID)
-
-		case msg := <-h.broadcast:
-			h.handleBroadcast(msg)
+// close закрывает подключение. Канал send никогда не закрывается —
+// это исключает панику "send on closed channel" у конкурентных отправителей.
+func (c *Client) close() {
+	c.closeOnce.Do(func() {
+		close(c.done)
+		if c.conn != nil {
+			c.conn.Close()
 		}
+	})
+}
+
+// enqueue кладёт данные в очередь клиента. Если клиент не успевает читать,
+// соединение закрывается: при переподключении он досинхронизируется по курсору.
+func (c *Client) enqueue(data []byte) {
+	select {
+	case <-c.done:
+		return
+	default:
+	}
+	select {
+	case c.send <- data:
+	case <-c.done:
+	default:
+		log.Printf("⚠️ Send buffer full for device=%s, dropping connection", c.deviceID)
+		c.close()
 	}
 }
 
-// handleBroadcast отправляет сообщение нужным клиентам
-func (h *Hub) handleBroadcast(msg *BroadcastMessage) {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-
-	if msg.RecipientID == 0 {
-		// Всем (кроме исключённого)
-		for deviceID, client := range h.clients {
-			if deviceID != msg.ExcludeDevice {
-				select {
-				case client.send <- msg.Data:
-				default:
-					// Буфер полон, пропускаем
-				}
-			}
-		}
-	} else {
-		// Конкретному пользователю (все его устройства)
-		for deviceID, client := range h.clients {
-			if client.userID == msg.RecipientID && deviceID != msg.ExcludeDevice {
-				select {
-				case client.send <- msg.Data:
-				default:
-				}
-			}
-		}
-	}
-}
-
-// SendToUser отправляет сообщение всем устройствам пользователя
-func (h *Hub) SendToUser(userID int64, data []byte, excludeDevice string) {
-	h.broadcast <- &BroadcastMessage{
-		RecipientID:   userID,
-		Data:          data,
-		ExcludeDevice: excludeDevice,
-	}
-}
-
-// SendToDevice отправляет сообщение конкретному устройству
-func (h *Hub) SendToDevice(deviceID string, data []byte) {
-	h.mu.RLock()
-	client, ok := h.clients[deviceID]
-	h.mu.RUnlock()
-
-	if ok {
-		select {
-		case client.send <- data:
-		default:
-		}
-	}
-}
-
-// RegisterClient регистрирует нового клиента
-func (h *Hub) RegisterClient(conn *websocket.Conn, userID int64, deviceID string) *Client {
-	client := &Client{
+// Register регистрирует подключение, вытесняя предыдущее с того же устройства.
+func (h *Hub) Register(conn *websocket.Conn, userID int64, deviceID string) *Client {
+	c := &Client{
 		hub:      h,
 		conn:     conn,
-		send:     make(chan []byte, 256),
+		send:     make(chan []byte, sendBuffer),
+		done:     make(chan struct{}),
 		userID:   userID,
 		deviceID: deviceID,
 	}
-
-	h.register <- client
-	return client
+	h.mu.Lock()
+	if old := h.clients[deviceID]; old != nil {
+		old.close()
+	}
+	h.clients[deviceID] = c
+	h.mu.Unlock()
+	log.Printf("📱 Client connected: device=%s user=%d", deviceID, userID)
+	return c
 }
 
-// UnregisterClient отключает клиента
-func (h *Hub) UnregisterClient(client *Client) {
-	h.unregister <- client
+func (h *Hub) unregister(c *Client) {
+	h.mu.Lock()
+	if h.clients[c.deviceID] == c {
+		delete(h.clients, c.deviceID)
+	}
+	h.mu.Unlock()
+	c.close()
+	log.Printf("📴 Client disconnected: device=%s", c.deviceID)
 }
 
-// GetOnlineDevices возвращает список онлайн устройств пользователя
-func (h *Hub) GetOnlineDevices(userID int64) []string {
+// SendToUser отправляет данные всем подключённым устройствам пользователя.
+func (h *Hub) SendToUser(userID int64, data []byte, excludeDevice string) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
-
-	var devices []string
-	for deviceID, client := range h.clients {
-		if client.userID == userID {
-			devices = append(devices, deviceID)
+	for id, c := range h.clients {
+		if c.userID == userID && id != excludeDevice {
+			c.enqueue(data)
 		}
 	}
-	return devices
 }
 
-// IsDeviceOnline проверяет онлайн ли устройство
+// SendToDevice отправляет данные одному устройству.
+func (h *Hub) SendToDevice(deviceID string, data []byte) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	if c := h.clients[deviceID]; c != nil {
+		c.enqueue(data)
+	}
+}
+
 func (h *Hub) IsDeviceOnline(deviceID string) bool {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
@@ -186,14 +132,51 @@ func (h *Hub) IsDeviceOnline(deviceID string) bool {
 	return ok
 }
 
-// DisconnectDevice принудительно разрывает соединение с устройством
+// DisconnectDevice принудительно закрывает подключение устройства (при отзыве).
 func (h *Hub) DisconnectDevice(deviceID string) {
 	h.mu.Lock()
-	client, ok := h.clients[deviceID]
-	if ok {
-		delete(h.clients, deviceID)
-		close(client.send)
-		client.conn.Close()
-	}
+	c := h.clients[deviceID]
+	delete(h.clients, deviceID)
 	h.mu.Unlock()
+	if c != nil {
+		c.close()
+	}
+}
+
+// CloseAll закрывает все подключения (при остановке сервера).
+func (h *Hub) CloseAll() {
+	h.mu.Lock()
+	clients := h.clients
+	h.clients = make(map[string]*Client)
+	h.mu.Unlock()
+	for _, c := range clients {
+		c.close()
+	}
+}
+
+// Envelope — обёртка всех сообщений канала.
+type Envelope struct {
+	Type string          `json:"type"`
+	Data json.RawMessage `json:"data"`
+}
+
+func encode(typ string, data any) []byte {
+	b, err := json.Marshal(map[string]any{"type": typ, "data": data})
+	if err != nil {
+		log.Printf("ws encode error: %v", err)
+		return nil
+	}
+	return b
+}
+
+// PublishMessage рассылает актуальное состояние сообщения обоим участникам.
+func (h *Hub) PublishMessage(m *models.Message) {
+	if m == nil {
+		return
+	}
+	data := encode("message", m)
+	h.SendToUser(m.SenderID, data, "")
+	if m.RecipientID != m.SenderID {
+		h.SendToUser(m.RecipientID, data, "")
+	}
 }

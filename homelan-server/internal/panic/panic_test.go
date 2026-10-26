@@ -6,77 +6,67 @@ import (
 	"testing"
 )
 
-type MockCloser struct {
-	closed bool
+type mockCloser struct{ closed int }
+
+func (m *mockCloser) Close() error { m.closed++; return nil }
+
+func setup(t *testing.T) (dir, dbPath, filesDir, keyPath, attachment string) {
+	t.Helper()
+	dir = t.TempDir()
+	dbPath = filepath.Join(dir, "messages.db")
+	filesDir = filepath.Join(dir, "files")
+	keyPath = filepath.Join(dir, "usb", "homelan.key")
+	attachment = filepath.Join(filesDir, "file1")
+	for _, d := range []string{filesDir, filepath.Dir(keyPath)} {
+		if err := os.MkdirAll(d, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for path, content := range map[string]string{
+		dbPath:          "database_content",
+		dbPath + "-wal": "wal",
+		dbPath + "-shm": "shm",
+		attachment:      "attachment",
+		keyPath:         "00112233",
+	} {
+		if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return
 }
 
-func (m *MockCloser) Close() error {
-	m.closed = true
-	return nil
+func gone(t *testing.T, path string) {
+	t.Helper()
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("expected %s to be deleted", path)
+	}
 }
 
-func TestPanicHandler(t *testing.T) {
-	// Create temporary directories
-	tempDir, err := os.MkdirTemp("", "homelan_panic_test")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(tempDir)
+func TestPanicWipesEverythingIncludingKey(t *testing.T) {
+	_, dbPath, filesDir, keyPath, attachment := setup(t)
+	closer := &mockCloser{}
+	completed := 0
+	h := New(closer, dbPath, filesDir, keyPath, func() { completed++ })
 
-	dbPath := filepath.Join(tempDir, "messages.db")
-	filesDir := filepath.Join(tempDir, "files")
+	h.Trigger(ReasonDuress)
+	h.Trigger(ReasonDeadMan) // повтор игнорируется
 
-	if err := os.MkdirAll(filesDir, 0700); err != nil {
-		t.Fatal(err)
+	if closer.closed != 1 || completed != 1 {
+		t.Fatalf("expected single run, closed=%d completed=%d", closer.closed, completed)
 	}
+	for _, p := range []string{dbPath, dbPath + "-wal", dbPath + "-shm", attachment, keyPath} {
+		gone(t, p)
+	}
+}
 
-	// Create dummy DB file, WAL, SHM
-	if err := os.WriteFile(dbPath, []byte("database_content_here_and_it_should_be_long_long_long_long_long_long"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(dbPath+"-wal", []byte("wal_content"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(dbPath+"-shm", []byte("shm_content"), 0600); err != nil {
-		t.Fatal(err)
-	}
+func TestPanicOnUSBRemovalDoesNotTouchKeyPath(t *testing.T) {
+	_, dbPath, filesDir, keyPath, _ := setup(t)
+	h := New(&mockCloser{}, dbPath, filesDir, keyPath, nil)
+	h.Trigger(ReasonUSBRemoved)
 
-	// Create dummy file attachment
-	dummyFilePath := filepath.Join(filesDir, "file1")
-	if err := os.WriteFile(dummyFilePath, []byte("attachment_content_here"), 0600); err != nil {
-		t.Fatal(err)
-	}
-
-	mockCloser := &MockCloser{}
-	completed := false
-
-	handler := New(mockCloser, dbPath, filesDir, func() {
-		completed = true
-	})
-
-	handler.Trigger("TEST_PANIC")
-
-	// 1. Verify DB closer was closed
-	if !mockCloser.closed {
-		t.Error("expected DB closer to be closed")
-	}
-
-	// 2. Verify files deleted
-	if _, err := os.Stat(dbPath); !os.IsNotExist(err) {
-		t.Error("expected DB file to be deleted")
-	}
-	if _, err := os.Stat(dbPath + "-wal"); !os.IsNotExist(err) {
-		t.Error("expected WAL to be deleted")
-	}
-	if _, err := os.Stat(dbPath + "-shm"); !os.IsNotExist(err) {
-		t.Error("expected SHM to be deleted")
-	}
-	if _, err := os.Stat(dummyFilePath); !os.IsNotExist(err) {
-		t.Error("expected dummy file attachment to be deleted")
-	}
-
-	// 3. Verify callback ran
-	if !completed {
-		t.Error("expected callback to run")
+	gone(t, dbPath)
+	if _, err := os.Stat(keyPath); err != nil {
+		t.Errorf("key file should be left alone on USB removal: %v", err)
 	}
 }
