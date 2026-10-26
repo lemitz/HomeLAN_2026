@@ -42,7 +42,8 @@ func (c *Client) readPump() {
 	for {
 		_, raw, err := c.conn.ReadMessage()
 		if err != nil {
-			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure, websocket.CloseAbnormalClosure) {
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure,
+				websocket.CloseAbnormalClosure, websocket.CloseNoStatusReceived) {
 				log.Printf("WebSocket error (device=%s): %v", c.deviceID, err)
 			}
 			return

@@ -27,6 +27,7 @@ func main() {
 	drive := flag.String("drive", "", "накопитель для --init-usb (по умолчанию — спросить)")
 	force := flag.Bool("force", false, "перезаписать существующий ключ (данные БД станут недоступны!)")
 	configPath := flag.String("config", "config.yaml", "путь к конфигу")
+	keyFile := flag.String("key-file", "", "ТОЛЬКО ДЛЯ РАЗРАБОТКИ: путь к homelan.key вместо поиска на USB")
 	flag.Parse()
 
 	log.Printf("HomeLAN Messenger Server %s", Version)
@@ -43,8 +44,14 @@ func main() {
 		log.Fatalf("❌ Failed to load config: %v", err)
 	}
 
-	log.Println("🔑 Looking for USB master key...")
-	masterKey, err := usb.FindMasterKey()
+	var masterKey *usb.MasterKey
+	if *keyFile != "" {
+		log.Printf("⚠️ DEVELOPMENT MODE: using key file %s instead of a USB drive", *keyFile)
+		masterKey, err = usb.LoadKeyFile(*keyFile)
+	} else {
+		log.Println("🔑 Looking for USB master key...")
+		masterKey, err = usb.FindMasterKey()
+	}
 	if err != nil {
 		if errors.Is(err, usb.ErrNoUSBFound) {
 			log.Println("❌ No USB drive with homelan.key found!")

@@ -1,182 +1,137 @@
 // lib/main.dart
 import 'dart:io';
+
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
-import 'package:shared_preferences/shared_preferences.dart';
-import 'services/services.dart';
-import 'services/mdns_service.dart';
+
 import 'providers/providers.dart';
 import 'screens/screens.dart';
-import 'screens/chat_screen.dart';
+import 'services/services.dart';
 
-const String defaultServerUrl = 'http://192.168.100.100:8080';
-
-class MyHttpOverrides extends HttpOverrides {
+class _LanHttpOverrides extends HttpOverrides {
   @override
   HttpClient createHttpClient(SecurityContext? context) {
-    final client = super.createHttpClient(context);
-    client.findProxy = (uri) => "DIRECT";
-    client.badCertificateCallback = (X509Certificate cert, String host, int port) => true;
-    return client;
+    // Сервер в локальной сети — системный прокси не нужен.
+    return super.createHttpClient(context)..findProxy = (_) => 'DIRECT';
   }
 }
 
-late ApiService apiService;
-late WebSocketService wsService;
-late DatabaseService dbService;
-late CryptoService cryptoService;
-late NotificationService notificationService;
-
-final GlobalKey<NavigatorState> navigatorKey = GlobalKey<NavigatorState>();
-
-// Определяем платформу один раз при старте
 final bool isWindows = Platform.isWindows;
 final bool isMobile = Platform.isAndroid || Platform.isIOS;
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  HttpOverrides.global = MyHttpOverrides();
+  HttpOverrides.global = _LanHttpOverrides();
 
-  String serverUrl = await _discoverOrLoadServerUrl();
-  print('🏁 FINAL SERVER URL: $serverUrl');
+  // Расшифрованные файлы с прошлого запуска не храним.
+  await ChatProvider.clearDecryptedFiles().catchError((_) {});
 
-  // Инициализируем ConnectionService для Windows
-  if (isWindows) {
-    ConnectionService().init(serverUrl);
-  }
+  final serverUrl = await ServerConfig.resolve();
+  ConnectionService().init(serverUrl);
 
-  apiService = ApiService(baseUrl: serverUrl);
-  wsService = WebSocketService(baseUrl: serverUrl);
-  dbService = DatabaseService();
-  cryptoService = CryptoService();
-  notificationService = NotificationService();
-  
+  final api = ApiService(baseUrl: serverUrl);
+  final ws = WebSocketService(baseUrl: serverUrl);
+  final db = DatabaseService();
+  final crypto = CryptoService();
+  final notifications = NotificationService();
   if (isMobile) {
-    await notificationService.init();
+    await notifications.init();
+    await ForegroundService().init();
   }
-  
-  runApp(HomeLanApp(serverUrl: serverUrl));
-}
 
-Future<String> _discoverOrLoadServerUrl() async {
-  final prefs = await SharedPreferences.getInstance();
-  
-  final savedUrl = prefs.getString('server_url');
-  if (savedUrl != null) {
-    print('📡 Found saved URL in cache: $savedUrl');
-    if (await MDNSService.checkServer(savedUrl)) {
-      print('✅ Saved URL is alive');
-      return savedUrl;
-    }
-    print('⚠️ Saved URL not responding, searching again...');
-  }
-  
-  print('📡 Searching for HomeLAN server via mDNS...');
-  final discoveredUrl = await MDNSService.discoverServer();
-  
-  if (discoveredUrl != null) {
-    await prefs.setString('server_url', discoveredUrl);
-    print('🎉 mDNS found: $discoveredUrl');
-    return discoveredUrl;
-  }
-  
-  print('⚠️ mDNS failed, using default: $defaultServerUrl');
-  return defaultServerUrl;
+  runApp(HomeLanApp(api: api, ws: ws, db: db, crypto: crypto, notifications: notifications));
 }
 
 class HomeLanApp extends StatelessWidget {
-  final String serverUrl;
-  
-  const HomeLanApp({super.key, required this.serverUrl});
+  final ApiService api;
+  final WebSocketService ws;
+  final DatabaseService db;
+  final CryptoService crypto;
+  final NotificationService notifications;
+
+  const HomeLanApp({
+    super.key,
+    required this.api,
+    required this.ws,
+    required this.db,
+    required this.crypto,
+    required this.notifications,
+  });
 
   @override
   Widget build(BuildContext context) {
-    // Определяем home виджет
-    Widget homeWidget;
-    if (isMobile) {
-      homeWidget = const LockScreen(child: AppStartup());
-    } else if (isWindows) {
-      homeWidget = ServerGuardScreen(child: const AppStartup());
-    } else {
-      homeWidget = const AppStartup();
-    }
-
-    // Базовое приложение с провайдерами
-    Widget app = MultiProvider(
+    return MultiProvider(
       providers: [
+        Provider.value(value: api),
+        Provider.value(value: db),
+        Provider.value(value: crypto),
+        ChangeNotifierProvider.value(value: ws),
+        ChangeNotifierProvider.value(value: ConnectionService()),
         ChangeNotifierProvider(
-          create: (_) => AuthProvider(
-            api: apiService,
-            ws: wsService,
-            db: dbService,
-            crypto: cryptoService,
-          ),
+          create: (_) => AuthProvider(api: api, ws: ws, db: db, crypto: crypto)..init(),
         ),
-        ChangeNotifierProvider(
-          create: (_) => ChatProvider(
-            ws: wsService,
-            db: dbService,
-            api: apiService,
-            crypto: cryptoService,
-            notifications: notificationService,
-          ),
+        ChangeNotifierProxyProvider<AuthProvider, ChatProvider>(
+          create: (_) => ChatProvider(ws: ws, db: db, api: api, crypto: crypto, notifications: notifications),
+          update: (_, auth, chat) => chat!..attachAuth(auth),
         ),
       ],
       child: MaterialApp(
-        navigatorKey: navigatorKey,
         title: 'HomeLAN',
         debugShowCheckedModeBanner: false,
         themeMode: ThemeMode.dark,
         theme: ThemeData(
           brightness: Brightness.dark,
-          primarySwatch: Colors.blue,
+          colorSchemeSeed: Colors.blue,
           scaffoldBackgroundColor: Colors.grey[900],
           splashFactory: NoSplash.splashFactory,
-          highlightColor: Colors.transparent,
-          splashColor: Colors.transparent,
-          fontFamily: 'Roboto',
           visualDensity: VisualDensity.compact,
-          pageTransitionsTheme: const PageTransitionsTheme(
-            builders: {
-              TargetPlatform.android: FadeUpwardsPageTransitionsBuilder(),
-              TargetPlatform.windows: FadeUpwardsPageTransitionsBuilder(),
-              TargetPlatform.iOS: CupertinoPageTransitionsBuilder(),
-            },
-          ),
         ),
-        home: homeWidget,
+        // Блокировка и защита сервера — поверх навигатора: закрывают все
+        // экраны, но не уничтожают их состояние.
+        builder: (context, child) {
+          Widget app = child ?? const SizedBox.shrink();
+          if (isWindows) app = ServerGuard(child: app);
+          if (isMobile) app = LockGate(child: app);
+          return AppLifecycleHooks(child: app);
+        },
+        home: const RootScreen(),
       ),
     );
-
-    // Для Windows оборачиваем в ConnectionService провайдер
-    if (isWindows) {
-      app = ChangeNotifierProvider.value(
-        value: ConnectionService(),
-        child: app,
-      );
-    }
-
-    return app;
   }
 }
 
-class AppStartup extends StatefulWidget {
-  const AppStartup({super.key});
+/// Выбирает экран по состоянию авторизации.
+class RootScreen extends StatelessWidget {
+  const RootScreen({super.key});
 
   @override
-  State<AppStartup> createState() => _AppStartupState();
+  Widget build(BuildContext context) {
+    final auth = context.watch<AuthProvider>();
+    switch (auth.status) {
+      case AuthStatus.loading:
+        return const SplashScreen();
+      case AuthStatus.loggedOut:
+        return const LoginScreen();
+      case AuthStatus.loggedIn:
+        return auth.hasPartner ? const ChatScreen() : const WaitingForPartnerScreen();
+    }
+  }
 }
 
-class _AppStartupState extends State<AppStartup> with WidgetsBindingObserver {
-  bool _isLoading = true;
-  String? _error;
-  bool _initialized = false;
+/// При возвращении в приложение — сразу переподключаемся и проверяем сессию.
+class AppLifecycleHooks extends StatefulWidget {
+  final Widget child;
+  const AppLifecycleHooks({super.key, required this.child});
 
+  @override
+  State<AppLifecycleHooks> createState() => _AppLifecycleHooksState();
+}
+
+class _AppLifecycleHooksState extends State<AppLifecycleHooks> with WidgetsBindingObserver {
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    _init();
   }
 
   @override
@@ -187,112 +142,34 @@ class _AppStartupState extends State<AppStartup> with WidgetsBindingObserver {
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.detached) {
-      final chat = context.read<ChatProvider>();
-      chat.clearLocalData();
+    if (state == AppLifecycleState.resumed) {
+      context.read<WebSocketService>().reconnectNow();
+      context.read<AuthProvider>().refreshSession();
     }
   }
 
-  Future<void> _init() async {
-    if (_initialized) return;
-    _initialized = true;
-    
-    try {
-      final auth = context.read<AuthProvider>();
-      await auth.init();
-      
-      if (auth.isLoggedIn && auth.userId != null) {
-        final chat = context.read<ChatProvider>();
-        chat.setUserId(auth.userId!);
-        
-        // Для Windows — запускаем мониторинг
-        if (isWindows) {
-          await ConnectionService().startMonitoring();
-        }
-      }
-      
-      notificationService.onNotificationTap = _onNotificationTap;
-      
-      if (mounted) {
-        setState(() => _isLoading = false);
-      }
-    } catch (e) {
-      if (mounted) {
-        setState(() {
-          _isLoading = false;
-          _error = e.toString();
-        });
-      }
-    }
-  }
+  @override
+  Widget build(BuildContext context) => widget.child;
+}
 
-  void _onNotificationTap(int? oderId) {}
+class SplashScreen extends StatelessWidget {
+  const SplashScreen({super.key});
 
   @override
   Widget build(BuildContext context) {
-    if (_isLoading) {
-      return Scaffold(
-        backgroundColor: Colors.grey[900],
-        body: Center(
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              Icon(Icons.lock_outline, size: 80, color: Colors.blue[400]),
-              const SizedBox(height: 24),
-              const Text('HomeLAN', style: TextStyle(fontSize: 28, fontWeight: FontWeight.bold, color: Colors.white)),
-              const SizedBox(height: 8),
-              Text('🔐 E2E Encrypted', style: TextStyle(fontSize: 14, color: Colors.green[400])),
-              const SizedBox(height: 24),
-              const CircularProgressIndicator(),
-            ],
-          ),
+    return Scaffold(
+      body: Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.lock_outline, size: 80, color: Colors.blue[400]),
+            const SizedBox(height: 24),
+            const Text('HomeLAN', style: TextStyle(fontSize: 28, fontWeight: FontWeight.bold)),
+            const SizedBox(height: 24),
+            const CircularProgressIndicator(),
+          ],
         ),
-      );
-    }
-
-    if (_error != null) {
-      return Scaffold(
-        backgroundColor: Colors.grey[900],
-        body: Center(
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              Icon(Icons.error_outline, size: 80, color: Colors.red[400]),
-              const SizedBox(height: 24),
-              const Text('Ошибка', style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold, color: Colors.white)),
-              const SizedBox(height: 16),
-              Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 32),
-                child: Text(_error!, style: TextStyle(color: Colors.grey[400]), textAlign: TextAlign.center),
-              ),
-              const SizedBox(height: 24),
-              ElevatedButton(
-                onPressed: () {
-                  setState(() { _isLoading = true; _error = null; _initialized = false; });
-                  _init();
-                },
-                child: const Text('Повторить'),
-              ),
-            ],
-          ),
-        ),
-      );
-    }
-
-    final auth = context.watch<AuthProvider>();
-    
-    if (auth.isLoggedIn) {
-      if (auth.hasPartner) {
-        return ChatScreen(
-          userId: auth.partnerId!,
-          username: auth.partnerUsername ?? 'Собеседник',
-          isRootScreen: true,
-        );
-      } else {
-        return const WaitingForPartnerScreen();
-      }
-    } else {
-      return const LoginScreen();
-    }
+      ),
+    );
   }
 }

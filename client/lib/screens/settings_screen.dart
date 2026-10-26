@@ -1,8 +1,9 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import '../providers/providers.dart';
-import 'login_screen.dart';
+import '../version.dart';
 import 'devices_screen.dart';
+import 'safety_number_screen.dart';
 
 class SettingsScreen extends StatefulWidget {
   const SettingsScreen({super.key});
@@ -12,14 +13,6 @@ class SettingsScreen extends StatefulWidget {
 }
 
 class _SettingsScreenState extends State<SettingsScreen> {
-  @override
-  void initState() {
-    super.initState();
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      context.read<ChatProvider>().loadBubbleColors();
-    });
-  }
-
   void _showColorPicker(String title, int currentColor, Function(int) onSelect) {
     final colors = [
       Colors.blue,
@@ -35,7 +28,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
       Colors.grey[800]!,
       Colors.grey[700]!,
     ];
-    
+
     showDialog(
       context: context,
       builder: (context) => AlertDialog(
@@ -44,23 +37,23 @@ class _SettingsScreenState extends State<SettingsScreen> {
         content: Wrap(
           spacing: 12,
           runSpacing: 12,
-          children: colors.map((color) => GestureDetector(
-            onTap: () {
-              onSelect(color.value);
-              Navigator.pop(context);
-            },
-            child: Container(
-              width: 48,
-              height: 48,
-              decoration: BoxDecoration(
-                color: color,
-                shape: BoxShape.circle,
-                border: currentColor == color.value
-                    ? Border.all(color: Colors.white, width: 3)
-                    : null,
-              ),
-            ),
-          )).toList(),
+          children: colors
+              .map((color) => GestureDetector(
+                    onTap: () {
+                      onSelect(color.toARGB32());
+                      Navigator.pop(context);
+                    },
+                    child: Container(
+                      width: 48,
+                      height: 48,
+                      decoration: BoxDecoration(
+                        color: color,
+                        shape: BoxShape.circle,
+                        border: currentColor == color.toARGB32() ? Border.all(color: Colors.white, width: 3) : null,
+                      ),
+                    ),
+                  ))
+              .toList(),
         ),
       ),
     );
@@ -79,9 +72,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
       'Может тебе ещё пароль 1234 поставить? 🤔',
       'Отключить шифрование = отправить нюдсы в интернет 📸',
     ];
-    
+
     final random = phrases[DateTime.now().millisecond % phrases.length];
-    
+
     showDialog(
       context: context,
       builder: (context) => AlertDialog(
@@ -125,7 +118,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Text(
-              'Версия 0.9.0',
+              'Версия $appVersion (протокол v$protocolVersion)',
               style: TextStyle(color: Colors.grey[300], fontSize: 16),
             ),
             const SizedBox(height: 16),
@@ -134,12 +127,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
               style: TextStyle(color: Colors.grey[400]),
             ),
             const SizedBox(height: 12),
-            _buildInfoRow(Icons.security, 'E2E шифрование', 'X25519 + ChaCha20-Poly1305'),
-            _buildInfoRow(Icons.storage, 'Хранение', 'SQLCipher + USB ключ'),
+            _buildInfoRow(Icons.security, 'E2E', 'X25519 + HKDF + XChaCha20-Poly1305'),
+            _buildInfoRow(Icons.storage, 'Сервер', 'SQLCipher + USB-ключ'),
+            _buildInfoRow(Icons.phone_android, 'Клиент', 'кеш только шифротекстов'),
             _buildInfoRow(Icons.devices, 'Платформы', 'Windows, Android'),
             const SizedBox(height: 16),
             Text(
-              '© 2025 HomeLAN Project',
+              '© 2026 HomeLAN Project',
               style: TextStyle(color: Colors.grey[600], fontSize: 12),
             ),
           ],
@@ -194,7 +188,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
       body: ListView(
         children: [
           const SizedBox(height: 16),
-          
+
           // Профиль
           Container(
             margin: const EdgeInsets.symmetric(horizontal: 16),
@@ -209,9 +203,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   radius: 30,
                   backgroundColor: Colors.blue[700],
                   child: Text(
-                    auth.username?.isNotEmpty == true
-                        ? auth.username![0].toUpperCase()
-                        : '?',
+                    auth.username?.isNotEmpty == true ? auth.username![0].toUpperCase() : '?',
                     style: const TextStyle(
                       color: Colors.white,
                       fontSize: 24,
@@ -266,9 +258,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
               ],
             ),
           ),
-          
+
           const SizedBox(height: 24),
-          
+
           // Устройства
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 16),
@@ -282,29 +274,42 @@ class _SettingsScreenState extends State<SettingsScreen> {
             ),
           ),
           const SizedBox(height: 8),
-          
+
           Container(
             margin: const EdgeInsets.symmetric(horizontal: 16),
             decoration: BoxDecoration(
               color: Colors.grey[850],
               borderRadius: BorderRadius.circular(12),
             ),
-            child: ListTile(
-              leading: Icon(Icons.devices, color: Colors.blue[400]),
-              title: const Text('Мои устройства', style: TextStyle(color: Colors.white)),
-              subtitle: Text('Управление привязанными устройствами', style: TextStyle(color: Colors.grey[500])),
-              trailing: const Icon(Icons.chevron_right, color: Colors.grey),
-              onTap: () {
-                Navigator.push(
-                  context,
-                  MaterialPageRoute(builder: (_) => const DevicesScreen()),
-                );
-              },
-            ),
+            child: Column(children: [
+              ListTile(
+                leading: Icon(Icons.devices, color: Colors.blue[400]),
+                title: const Text('Мои устройства', style: TextStyle(color: Colors.white)),
+                subtitle: Text('Управление привязанными устройствами', style: TextStyle(color: Colors.grey[500])),
+                trailing: const Icon(Icons.chevron_right, color: Colors.grey),
+                onTap: () {
+                  Navigator.push(
+                    context,
+                    MaterialPageRoute(builder: (_) => const DevicesScreen()),
+                  );
+                },
+              ),
+              if (auth.hasPartner) ...[
+                Divider(color: Colors.grey[800], height: 1),
+                ListTile(
+                  leading: Icon(Icons.fingerprint, color: Colors.green[400]),
+                  title: const Text('Отпечаток ключей', style: TextStyle(color: Colors.white)),
+                  subtitle:
+                      Text('Сверка с собеседником (защита от подмены)', style: TextStyle(color: Colors.grey[500])),
+                  trailing: const Icon(Icons.chevron_right, color: Colors.grey),
+                  onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const SafetyNumberScreen())),
+                ),
+              ],
+            ]),
           ),
-          
+
           const SizedBox(height: 24),
-          
+
           // Безопасность и Уведомления
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 16),
@@ -318,7 +323,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
             ),
           ),
           const SizedBox(height: 8),
-          
+
           Container(
             margin: const EdgeInsets.symmetric(horizontal: 16),
             decoration: BoxDecoration(
@@ -340,21 +345,19 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     ),
                     trailing: Switch(
                       value: chat.notificationsEnabled,
-                      activeColor: Colors.blue[400],
+                      activeThumbColor: Colors.blue[400],
                       onChanged: (value) => chat.setNotificationsEnabled(value),
                     ),
                   ),
                 ),
-                
                 Divider(color: Colors.grey[800], height: 1),
-
                 ListTile(
                   leading: Icon(Icons.lock, color: Colors.green[400]),
                   title: const Text('Сквозное шифрование', style: TextStyle(color: Colors.white)),
-                  subtitle: Text('X25519 + ChaCha20-Poly1305', style: TextStyle(color: Colors.grey[500])),
+                  subtitle: Text('X25519 + XChaCha20-Poly1305', style: TextStyle(color: Colors.grey[500])),
                   trailing: Switch(
                     value: true,
-                    activeColor: Colors.green[400],
+                    activeThumbColor: Colors.green[400],
                     onChanged: (value) {
                       if (!value) {
                         _showE2EWarning();
@@ -365,9 +368,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
               ],
             ),
           ),
-          
+
           const SizedBox(height: 24),
-          
+
           // Инфо
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 16),
@@ -381,7 +384,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
             ),
           ),
           const SizedBox(height: 8),
-          
+
           Container(
             margin: const EdgeInsets.symmetric(horizontal: 16),
             decoration: BoxDecoration(
@@ -403,7 +406,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
               ),
             ),
           ),
-          
+
           const SizedBox(height: 24),
 
           // Внешний вид
@@ -472,7 +475,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
           ),
 
           const SizedBox(height: 24),
-          
+
           // Действия
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 16),
@@ -486,7 +489,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
             ),
           ),
           const SizedBox(height: 8),
-          
+
           Container(
             margin: const EdgeInsets.symmetric(horizontal: 16),
             decoration: BoxDecoration(
@@ -502,7 +505,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     style: TextStyle(color: Colors.orange),
                   ),
                   subtitle: Text(
-                    'Сохранить локальные данные',
+                    'Ключ шифрования останется на устройстве',
                     style: TextStyle(color: Colors.grey[500], fontSize: 12),
                   ),
                   onTap: () => _showLogoutDialog(context, auth),
@@ -515,7 +518,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     style: TextStyle(color: Colors.red),
                   ),
                   subtitle: Text(
-                    'Удалить ВСЕ данные и ключи',
+                    'Удалить ключи и отвязать устройство',
                     style: TextStyle(color: Colors.grey[500], fontSize: 12),
                   ),
                   onTap: () => _showFullWipeDialog(context, auth),
@@ -523,9 +526,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
               ],
             ),
           ),
-          
+
           const SizedBox(height: 16),
-          
+
           Container(
             margin: const EdgeInsets.symmetric(horizontal: 16),
             padding: const EdgeInsets.all(12),
@@ -540,7 +543,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 const SizedBox(width: 12),
                 Expanded(
                   child: Text(
-                    'Полная очистка удалит все сообщения, ключи шифрования и данные авторизации без возможности восстановления!',
+                    'Полная очистка удалит ключ шифрования и отвяжет устройство. Вернуть доступ можно только новой привязкой с другого вашего устройства. Если это ваше единственное устройство — история станет нечитаемой навсегда.',
                     style: TextStyle(
                       color: Colors.red[300],
                       fontSize: 12,
@@ -550,7 +553,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
               ],
             ),
           ),
-          
+
           const Padding(
             padding: EdgeInsets.symmetric(horizontal: 16.0, vertical: 8.0),
             child: Divider(color: Colors.grey),
@@ -559,10 +562,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
           ListTile(
             leading: Icon(Icons.info_outline, color: Colors.grey[400]),
             title: const Text('О приложении', style: TextStyle(color: Colors.white)),
-            subtitle: Text('Версия 0.9.0', style: TextStyle(color: Colors.grey[500])),
+            subtitle:
+                Text('Версия $appVersion (протокол v$protocolVersion)', style: TextStyle(color: Colors.grey[500])),
             onTap: _showAboutDialog,
           ),
-          
+
           const SizedBox(height: 32),
         ],
       ),
@@ -576,7 +580,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
         backgroundColor: Colors.grey[850],
         title: const Text('Выход', style: TextStyle(color: Colors.white)),
         content: const Text(
-          'Вы уверены что хотите выйти?\n\nЛокальные сообщения будут сохранены.',
+          'Сессия на этом устройстве будет закрыта, локальный кеш сообщений очищен.\n\nКлюч шифрования останется — после входа по паролю история снова загрузится с сервера.',
           style: TextStyle(color: Colors.white),
         ),
         actions: [
@@ -594,12 +598,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
     );
 
     if (confirm == true && context.mounted) {
+      // Корневой экран сам переключится на вход — просто закрываем всё поверх него.
+      Navigator.of(context).popUntil((route) => route.isFirst);
       await auth.logout();
-      Navigator.pushAndRemoveUntil(
-        context,
-        MaterialPageRoute(builder: (_) => const LoginScreen()),
-        (route) => false,
-      );
     }
   }
 
@@ -621,10 +622,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
           children: [
             const Text('Это действие удалит:', style: TextStyle(color: Colors.white)),
             const SizedBox(height: 12),
-            _buildWipeItem('Все сообщения'),
-            _buildWipeItem('Ключи шифрования'),
-            _buildWipeItem('Данные авторизации'),
-            _buildWipeItem('Кэш и настройки'),
+            _buildWipeItem('Ключ шифрования'),
+            _buildWipeItem('Привязку этого устройства'),
+            _buildWipeItem('Локальный кеш и настройки'),
             const SizedBox(height: 16),
             Text(
               'Восстановление невозможно!',
@@ -662,15 +662,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
         ),
       );
 
+      final navigator = Navigator.of(context);
       await auth.fullWipe();
-
-      if (context.mounted) {
-        Navigator.pushAndRemoveUntil(
-          context,
-          MaterialPageRoute(builder: (_) => const LoginScreen()),
-          (route) => false,
-        );
-      }
+      navigator.popUntil((route) => route.isFirst);
     }
   }
 

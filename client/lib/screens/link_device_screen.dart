@@ -1,13 +1,18 @@
 // lib/screens/link_device_screen.dart
-import 'dart:convert';
-import 'dart:io';
+//
+// ОСНОВНОЕ устройство (авторизовано): получает QR#1 нового устройства,
+// после сверки кода создаёт код привязки и показывает QR#2 с
+// identity-ключом, зашифрованным эфемерным ключом нового устройства.
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:mobile_scanner/mobile_scanner.dart';
 import 'package:provider/provider.dart';
 import 'package:qr_flutter/qr_flutter.dart';
+
 import '../providers/auth_provider.dart';
-import '../main.dart';
+import '../services/services.dart';
+import '../widgets/qr_scan_view.dart';
 
 class LinkDeviceScreen extends StatefulWidget {
   const LinkDeviceScreen({super.key});
@@ -17,315 +22,231 @@ class LinkDeviceScreen extends StatefulWidget {
 }
 
 class _LinkDeviceScreenState extends State<LinkDeviceScreen> {
-  String? _linkCode;
-  String? _exportedKey;
-  bool _isLoading = false;
-  bool _isScanning = false;
+  final _requestController = TextEditingController();
+  LinkRequest? _request;
+  String? _verification;
+  String? _response;
+  DateTime? _expiresAt;
+  Timer? _ticker;
+  bool _busy = false;
   String? _error;
 
-  bool get _isDesktop => Platform.isWindows || Platform.isLinux || Platform.isMacOS;
-
   @override
-  void initState() {
-    super.initState();
-    _generateCode();
+  void dispose() {
+    _requestController.dispose();
+    _ticker?.cancel();
+    super.dispose();
   }
 
-  Future<void> _generateCode() async {
+  Future<void> _scan() async {
+    final value = await QrScanPage.open(context,
+        hint: 'Отсканируйте QR-код на новом устройстве', accept: (v) => LinkRequest.tryParse(v) != null);
+    if (value != null) await _accept(value);
+  }
+
+  Future<void> _accept(String input) async {
+    final req = LinkRequest.tryParse(input);
+    if (req == null) {
+      setState(() => _error = 'Это не запрос привязки. Скопируйте текст целиком (начинается с HL1:)');
+      return;
+    }
+    final code = await LinkCrypto.verificationCode(req.ephemeralPublic);
+    if (!mounted) return;
     setState(() {
-      _isLoading = true;
+      _request = req;
+      _verification = code;
       _error = null;
     });
+  }
 
+  Future<void> _confirm() async {
+    final req = _request!;
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
     try {
-      final authProvider = context.read<AuthProvider>();
-      
-      // Получаем код привязки с сервера
-      final result = await authProvider.apiService.createLinkCode(
-        userId: authProvider.userId!,
+      final auth = context.read<AuthProvider>();
+      final data = await auth.api.createLinkCode(
+        deviceId: req.deviceId,
+        deviceName: req.deviceName,
+        deviceType: req.deviceType,
       );
-
-      // Экспортируем ключ для передачи на новое устройство
-      final exportedKey = await cryptoService.exportKeyPair();
-
+      final code = data['link_code'] as String;
+      final identity = await auth.crypto.exportIdentityPrivate();
+      final (ephPub, ct) = await LinkCrypto.seal(
+        identityPrivate: identity,
+        newDevicePublic: req.ephemeralPublic,
+        deviceId: req.deviceId,
+        code: code,
+      );
+      identity.fillRange(0, identity.length, 0);
+      if (!mounted) return;
       setState(() {
-        _linkCode = result['link_code'];
-        _exportedKey = exportedKey;
-        _isLoading = false;
+        _response = LinkResponse(code: code, ephemeralPublic: ephPub, ciphertext: ct).encode();
+        _expiresAt = DateTime.fromMillisecondsSinceEpoch((data['expires_at'] as int) * 1000);
+        _busy = false;
+      });
+      _ticker = Timer.periodic(const Duration(seconds: 1), (_) {
+        if (!mounted) return;
+        if (DateTime.now().isAfter(_expiresAt!)) {
+          _ticker?.cancel();
+          setState(() => _response = null);
+        } else {
+          setState(() {});
+        }
+      });
+    } on ApiException catch (e) {
+      setState(() {
+        _busy = false;
+        _error = e.userMessage;
       });
     } catch (e) {
       setState(() {
-        _error = e.toString();
-        _isLoading = false;
+        _busy = false;
+        _error = e is NetworkException ? 'Сервер недоступен' : '$e';
       });
     }
-  }
-
-  void _copyCode() {
-    if (_linkCode != null) {
-      Clipboard.setData(ClipboardData(text: _linkCode!));
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Код скопирован')),
-      );
-    }
-  }
-
-  void _copyFullData() {
-    if (_linkCode != null && _exportedKey != null) {
-      final fullData = '$_linkCode:$_exportedKey';
-      Clipboard.setData(ClipboardData(text: fullData));
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Код и ключ скопированы')),
-      );
-    }
-  }
-
-  String _getQrData() {
-    return jsonEncode({
-      'type': 'link_code',
-      'code': _linkCode,
-      'key': _exportedKey,
-    });
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: Colors.grey[900],
-      appBar: AppBar(
-        backgroundColor: Colors.grey[850],
-        title: const Text('Добавить устройство', style: TextStyle(color: Colors.white)),
-        iconTheme: const IconThemeData(color: Colors.white),
-      ),
-      body: _isLoading
-          ? const Center(child: CircularProgressIndicator())
-          : _linkCode != null
-              ? _buildShowCode()
-              : _buildError(),
-    );
-  }
-
-  Widget _buildError() {
-    return Padding(
-      padding: const EdgeInsets.all(24),
-      child: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          Icon(Icons.error_outline, size: 80, color: Colors.red[400]),
-          const SizedBox(height: 24),
-          const Text(
-            'Ошибка создания кода',
-            style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold, color: Colors.white),
+      appBar: AppBar(title: const Text('Добавить устройство')),
+      body: SingleChildScrollView(
+        padding: const EdgeInsets.all(24),
+        child: Center(
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 480),
+            child: _busy
+                ? const Padding(padding: EdgeInsets.all(48), child: CircularProgressIndicator())
+                : _response != null
+                    ? _buildResponse()
+                    : _request != null
+                        ? _buildConfirm()
+                        : _buildInput(),
           ),
-          if (_error != null) ...[
-            const SizedBox(height: 16),
-            Text(
-              _error!,
-              style: TextStyle(color: Colors.grey[400]),
-              textAlign: TextAlign.center,
-            ),
-          ],
-          const SizedBox(height: 24),
-          ElevatedButton(
-            onPressed: _generateCode,
-            child: const Text('Повторить'),
-          ),
-        ],
+        ),
       ),
     );
   }
 
-  Widget _buildShowCode() {
-    final qrData = _getQrData();
+  Widget _card(List<Widget> children) => Container(
+        width: double.infinity,
+        padding: const EdgeInsets.all(20),
+        decoration: BoxDecoration(color: Colors.grey[850], borderRadius: BorderRadius.circular(16)),
+        child: Column(children: children),
+      );
 
-    return SingleChildScrollView(
-      padding: const EdgeInsets.all(24),
-      child: Column(
-        children: [
-          // Инструкция
-          Container(
-            padding: const EdgeInsets.all(24),
-            decoration: BoxDecoration(
-              color: Colors.grey[850],
-              borderRadius: BorderRadius.circular(16),
-            ),
-            child: Column(
-              children: [
-                Icon(Icons.devices, size: 48, color: Colors.blue[400]),
-                const SizedBox(height: 16),
-                const Text(
-                  'Привязка нового устройства',
-                  style: TextStyle(
-                    fontSize: 20,
-                    fontWeight: FontWeight.bold,
-                    color: Colors.white,
-                  ),
-                ),
-                const SizedBox(height: 16),
-                Text(
-                  '1. Откройте приложение на новом устройстве\n'
-                  '2. Нажмите "Привязать к аккаунту"\n'
-                  '3. Отсканируйте QR-код ниже',
-                  style: TextStyle(color: Colors.grey[400], fontSize: 14),
-                  textAlign: TextAlign.center,
-                ),
-              ],
-            ),
-          ),
-          
-          const SizedBox(height: 24),
-          
-          // QR-код с кодом И ключом
-          Container(
-            padding: const EdgeInsets.all(24),
-            decoration: BoxDecoration(
-              color: Colors.grey[850],
-              borderRadius: BorderRadius.circular(16),
-            ),
-            child: Column(
-              children: [
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    Icon(Icons.qr_code_2, size: 24, color: Colors.green[400]),
-                    const SizedBox(width: 8),
-                    const Text(
-                      'QR содержит код + ключ шифрования',
-                      style: TextStyle(
-                        fontSize: 14,
-                        fontWeight: FontWeight.bold,
-                        color: Colors.white,
-                      ),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 16),
-                Container(
-                  padding: const EdgeInsets.all(16),
-                  decoration: BoxDecoration(
-                    color: Colors.white,
-                    borderRadius: BorderRadius.circular(12),
-                  ),
-                  child: QrImageView(
-                    data: qrData,
-                    size: 250,
-                    backgroundColor: Colors.white,
-                    errorCorrectionLevel: QrErrorCorrectLevel.L,
-                  ),
-                ),
-                const SizedBox(height: 12),
-                Text(
-                  '🔐 Ключ шифрования включён в QR',
-                  style: TextStyle(color: Colors.green[400], fontSize: 12),
-                ),
-              ],
-            ),
-          ),
-          
-          const SizedBox(height: 24),
-          
-          // Текстовый код (только код, без ключа - для ручного ввода)
-          Container(
-            padding: const EdgeInsets.all(24),
-            decoration: BoxDecoration(
-              color: Colors.grey[850],
-              borderRadius: BorderRadius.circular(16),
-            ),
-            child: Column(
-              children: [
-                Icon(Icons.keyboard, size: 32, color: Colors.orange[400]),
-                const SizedBox(height: 12),
-                const Text(
-                  'Нет камеры? Код для ввода:',
-                  style: TextStyle(
-                    fontSize: 14,
-                    color: Colors.white,
-                  ),
-                ),
-                const SizedBox(height: 16),
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 16),
-                      decoration: BoxDecoration(
-                        color: Colors.grey[700],
-                        borderRadius: BorderRadius.circular(12),
-                      ),
-                      child: Text(
-                        _linkCode!,
-                        style: const TextStyle(
-                          fontSize: 28,
-                          fontWeight: FontWeight.bold,
-                          letterSpacing: 3,
-                          color: Colors.white,
-                          fontFamily: 'monospace',
-                        ),
-                      ),
-                    ),
-                    const SizedBox(width: 12),
-                    IconButton(
-                      onPressed: _copyCode,
-                      icon: Icon(Icons.copy, color: Colors.blue[400]),
-                      tooltip: 'Копировать код',
-                      iconSize: 28,
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 16),
-                Text(
-                  '⚠️ При ручном вводе ключ передастся отдельно',
-                  style: TextStyle(color: Colors.orange[400], fontSize: 12),
-                ),
-                const SizedBox(height: 8),
-                TextButton.icon(
-                  onPressed: _copyFullData,
-                  icon: const Icon(Icons.vpn_key, size: 16),
-                  label: const Text('Копировать код + ключ'),
-                  style: TextButton.styleFrom(
-                    foregroundColor: Colors.orange[400],
-                  ),
-                ),
-                const SizedBox(height: 16),
-                Text(
-                  '⏱ Код действителен 5 минут',
-                  style: TextStyle(color: Colors.grey[500], fontSize: 12),
-                ),
-              ],
-            ),
-          ),
-          
-          const SizedBox(height: 24),
-          
-          // Кнопки внизу
-          Row(
-            children: [
-              Expanded(
-                child: OutlinedButton.icon(
-                  onPressed: _generateCode,
-                  icon: const Icon(Icons.refresh),
-                  label: const Text('Новый код'),
-                  style: OutlinedButton.styleFrom(
-                    padding: const EdgeInsets.symmetric(vertical: 16),
-                    side: BorderSide(color: Colors.grey[600]!),
-                  ),
-                ),
-              ),
-              const SizedBox(width: 16),
-              Expanded(
-                child: ElevatedButton(
-                  onPressed: () => Navigator.pop(context),
-                  style: ElevatedButton.styleFrom(
-                    padding: const EdgeInsets.symmetric(vertical: 16),
-                    backgroundColor: Colors.green[600],
-                  ),
-                  child: const Text('Готово', style: TextStyle(color: Colors.white)),
-                ),
-              ),
-            ],
-          ),
-        ],
+  Widget _errorText() => _error == null
+      ? const SizedBox.shrink()
+      : Padding(
+          padding: const EdgeInsets.only(top: 12),
+          child: Text(_error!, style: const TextStyle(color: Colors.redAccent), textAlign: TextAlign.center),
+        );
+
+  Widget _buildInput() {
+    return _card([
+      Icon(Icons.add_to_home_screen, size: 48, color: Colors.blue[400]),
+      const SizedBox(height: 12),
+      Text(
+        'На новом устройстве нажмите «Привязать к аккаунту». '
+        'Отсканируйте показанный там код или вставьте его текст.',
+        textAlign: TextAlign.center,
+        style: TextStyle(color: Colors.grey[400]),
       ),
-    );
+      const SizedBox(height: 16),
+      if (canScanQr)
+        SizedBox(
+          width: double.infinity,
+          height: 48,
+          child: ElevatedButton.icon(
+              onPressed: _scan, icon: const Icon(Icons.qr_code_scanner), label: const Text('Сканировать')),
+        ),
+      const SizedBox(height: 12),
+      TextField(
+        controller: _requestController,
+        minLines: 2,
+        maxLines: 4,
+        style: const TextStyle(fontSize: 12, fontFamily: 'monospace'),
+        decoration: InputDecoration(
+          hintText: 'Или вставьте текст запроса (HL1:...)',
+          filled: true,
+          fillColor: Colors.grey[800],
+          border: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide.none),
+        ),
+      ),
+      const SizedBox(height: 12),
+      SizedBox(
+        width: double.infinity,
+        height: 48,
+        child: OutlinedButton(onPressed: () => _accept(_requestController.text), child: const Text('Продолжить')),
+      ),
+      _errorText(),
+    ]);
+  }
+
+  Widget _buildConfirm() {
+    final req = _request!;
+    return _card([
+      const Text('Подтвердите устройство', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+      const SizedBox(height: 16),
+      ListTile(
+        leading: Icon(req.deviceType == 'android' ? Icons.phone_android : Icons.computer),
+        title: Text(req.deviceName.isEmpty ? req.deviceType : req.deviceName),
+        subtitle: Text(req.deviceType),
+      ),
+      const SizedBox(height: 8),
+      Text('Код сверки', style: TextStyle(color: Colors.grey[500], fontSize: 12)),
+      Text(_verification!, style: const TextStyle(fontSize: 28, letterSpacing: 4, fontWeight: FontWeight.bold)),
+      const SizedBox(height: 8),
+      Text('Убедитесь, что на новом устройстве показан ТОТ ЖЕ код.',
+          textAlign: TextAlign.center, style: TextStyle(color: Colors.orange[300])),
+      const SizedBox(height: 16),
+      Row(children: [
+        Expanded(
+          child: OutlinedButton(
+            onPressed: () => setState(() {
+              _request = null;
+              _verification = null;
+            }),
+            child: const Text('Не совпадает'),
+          ),
+        ),
+        const SizedBox(width: 12),
+        Expanded(child: ElevatedButton(onPressed: _confirm, child: const Text('Коды совпадают'))),
+      ]),
+      _errorText(),
+    ]);
+  }
+
+  Widget _buildResponse() {
+    final left = _expiresAt!.difference(DateTime.now());
+    final mm = left.inMinutes.toString().padLeft(2, '0');
+    final ss = (left.inSeconds % 60).toString().padLeft(2, '0');
+    return _card([
+      const Text('Покажите этот код новому устройству', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+      const SizedBox(height: 16),
+      Container(
+        color: Colors.white,
+        padding: const EdgeInsets.all(12),
+        child: QrImageView(data: _response!, size: 240, backgroundColor: Colors.white),
+      ),
+      const SizedBox(height: 12),
+      TextButton.icon(
+        onPressed: () {
+          Clipboard.setData(ClipboardData(text: _response!));
+          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Скопировано')));
+        },
+        icon: const Icon(Icons.copy),
+        label: const Text('Нет камеры? Скопировать как текст'),
+      ),
+      Text('Ключ зашифрован для выбранного устройства — другим он бесполезен.',
+          textAlign: TextAlign.center, style: TextStyle(color: Colors.grey[500], fontSize: 12)),
+      const SizedBox(height: 8),
+      Text('Действует ещё $mm:$ss', style: TextStyle(color: Colors.grey[400])),
+      const SizedBox(height: 16),
+      ElevatedButton(onPressed: () => Navigator.pop(context), child: const Text('Готово')),
+    ]);
   }
 }

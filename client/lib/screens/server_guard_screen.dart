@@ -1,104 +1,104 @@
 // lib/screens/server_guard_screen.dart
-
 import 'package:flutter/material.dart';
-import '../services/connection_service.dart';
 
-class ServerGuardScreen extends StatefulWidget {
+import '../services/connection_service.dart';
+import '../widgets/server_address.dart';
+
+/// Windows: пока сервер недоступен, содержимое приложения скрыто
+/// (решение v0.9 — переписка на ПК видна только при связи с домашним сервером).
+/// Экран рисуется поверх приложения и не сбрасывает его состояние.
+class ServerGuard extends StatefulWidget {
   final Widget child;
-  
-  const ServerGuardScreen({super.key, required this.child});
+  const ServerGuard({super.key, required this.child});
 
   @override
-  State<ServerGuardScreen> createState() => _ServerGuardScreenState();
+  State<ServerGuard> createState() => _ServerGuardState();
 }
 
-class _ServerGuardScreenState extends State<ServerGuardScreen> {
+class _ServerGuardState extends State<ServerGuard> {
   final _conn = ConnectionService();
-  bool _isRetrying = false;
+  bool _retrying = false;
+  // Свой Overlay нужен полю ввода адреса: мы находимся выше Navigator.
+  // Запись пересоздаётся при каждом появлении экрана.
+  OverlayEntry? _entry;
 
   @override
   void initState() {
     super.initState();
-    _conn.addListener(_onStateChanged);
+    _conn.addListener(_refresh);
+    _conn.startMonitoring();
   }
 
   @override
   void dispose() {
-    _conn.removeListener(_onStateChanged);
+    _conn.removeListener(_refresh);
+    _conn.stopMonitoring();
     super.dispose();
   }
 
-  void _onStateChanged() {
-    if (mounted) setState(() {});
+  void _refresh() {
+    if (!mounted) return;
+    setState(() {});
+    if (_entry?.mounted == true) _entry!.markNeedsBuild();
   }
 
   Future<void> _retry() async {
-    if (_isRetrying) return;
-    setState(() => _isRetrying = true);
+    if (_retrying) return;
+    _retrying = true;
+    _refresh();
     await _conn.tryReconnect();
-    if (mounted) setState(() => _isRetrying = false);
+    _retrying = false;
+    _refresh();
   }
 
   @override
   Widget build(BuildContext context) {
-    if (_conn.isConnected) {
-      return widget.child;
+    final show = !_conn.isConnected;
+    if (show) {
+      _entry ??= OverlayEntry(builder: (_) => _buildOverlay());
+    } else {
+      _entry = null;
     }
+    return Stack(
+      textDirection: TextDirection.ltr,
+      children: [
+        widget.child,
+        if (show) Positioned.fill(child: Overlay(key: ObjectKey(_entry), initialEntries: [_entry!])),
+      ],
+    );
+  }
 
-    return Scaffold(
-      backgroundColor: Colors.black,
-      body: Container(
-        decoration: BoxDecoration(
-          gradient: LinearGradient(
-            begin: Alignment.topCenter,
-            end: Alignment.bottomCenter,
-            colors: [Colors.grey[900]!, Colors.black],
-          ),
-        ),
-        child: Center(
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              Icon(
-                _conn.isDisconnected ? Icons.cloud_off : Icons.cloud_sync,
-                size: 80,
-                color: _conn.isDisconnected ? Colors.red[400] : Colors.blue[400],
+  Widget _buildOverlay() {
+    final down = _conn.isDisconnected;
+    return Material(
+      color: Colors.black,
+      child: Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(down ? Icons.cloud_off : Icons.cloud_sync, size: 80, color: down ? Colors.red[400] : Colors.blue[400]),
+            const SizedBox(height: 24),
+            const Text('HomeLAN', style: TextStyle(fontSize: 32, fontWeight: FontWeight.bold, color: Colors.white)),
+            const SizedBox(height: 16),
+            Text(down ? 'Сервер недоступен' : 'Подключение...',
+                style: TextStyle(fontSize: 16, color: down ? Colors.red[400] : Colors.blue[400])),
+            if (down && _conn.disconnectReason != null)
+              Padding(
+                padding: const EdgeInsets.only(top: 8),
+                child: Text(_conn.disconnectReason!, style: TextStyle(color: Colors.grey[500])),
               ),
-              const SizedBox(height: 24),
-              const Text(
-                'HomeLAN',
-                style: TextStyle(fontSize: 32, fontWeight: FontWeight.bold, color: Colors.white),
+            const SizedBox(height: 32),
+            if (!down || _retrying)
+              const CircularProgressIndicator()
+            else
+              ElevatedButton.icon(
+                onPressed: _retry,
+                icon: const Icon(Icons.refresh),
+                label: const Text('Переподключиться'),
               ),
-              const SizedBox(height: 16),
-              Text(
-                _conn.isDisconnected ? '⚠️ Сервер недоступен' : 'Подключение...',
-                style: TextStyle(
-                  fontSize: 16,
-                  color: _conn.isDisconnected ? Colors.red[400] : Colors.blue[400],
-                ),
-              ),
-              if (_conn.disconnectReason != null)
-                Padding(
-                  padding: const EdgeInsets.only(top: 8),
-                  child: Text(
-                    _conn.disconnectReason!,
-                    style: TextStyle(fontSize: 14, color: Colors.grey[500]),
-                  ),
-                ),
-              const SizedBox(height: 48),
-              if (_conn.state == ServerConnectionState.checking || _isRetrying)
-                const CircularProgressIndicator()
-              else if (_conn.isDisconnected)
-                ElevatedButton.icon(
-                  onPressed: _retry,
-                  icon: const Icon(Icons.refresh),
-                  label: const Text('Переподключиться'),
-                  style: ElevatedButton.styleFrom(
-                    padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 16),
-                  ),
-                ),
-            ],
-          ),
+            const SizedBox(height: 24),
+            const ServerAddressField(),
+          ],
         ),
       ),
     );

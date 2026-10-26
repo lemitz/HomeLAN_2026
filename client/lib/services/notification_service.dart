@@ -1,5 +1,5 @@
 import 'dart:io';
-import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 
 class NotificationService {
@@ -8,9 +8,9 @@ class NotificationService {
   NotificationService._internal();
 
   final FlutterLocalNotificationsPlugin _notifications = FlutterLocalNotificationsPlugin();
-  
+
   bool _isInitialized = false;
-  
+
   // Callback когда юзер нажал на уведомление
   Function(int? userId)? onNotificationTap;
 
@@ -19,7 +19,7 @@ class NotificationService {
 
     // Android настройки
     const androidSettings = AndroidInitializationSettings('@mipmap/ic_launcher');
-    
+
     // iOS настройки (на всякий случай)
     const iosSettings = DarwinInitializationSettings(
       requestAlertPermission: true,
@@ -46,13 +46,13 @@ class NotificationService {
     await _createNotificationChannel();
 
     _isInitialized = true;
-    print('🔔 NotificationService initialized');
+    debugPrint('🔔 NotificationService initialized');
   }
 
   Future<void> _requestPermissions() async {
-    final androidPlugin = _notifications.resolvePlatformSpecificImplementation<
-        AndroidFlutterLocalNotificationsPlugin>();
-    
+    final androidPlugin =
+        _notifications.resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>();
+
     if (androidPlugin != null) {
       await androidPlugin.requestNotificationsPermission();
     }
@@ -69,21 +69,21 @@ class NotificationService {
       showBadge: true,
     );
 
-    final androidPlugin = _notifications.resolvePlatformSpecificImplementation<
-        AndroidFlutterLocalNotificationsPlugin>();
-    
+    final androidPlugin =
+        _notifications.resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>();
+
     await androidPlugin?.createNotificationChannel(channel);
   }
 
   void _onNotificationTap(NotificationResponse response) {
-    print('🔔 Notification tapped: ${response.payload}');
-    
+    debugPrint('🔔 Notification tapped: ${response.payload}');
+
     if (response.payload != null) {
       try {
         final userId = int.tryParse(response.payload!);
         onNotificationTap?.call(userId);
       } catch (e) {
-        print('Error parsing notification payload: $e');
+        debugPrint('Error parsing notification payload: $e');
       }
     }
   }
@@ -149,7 +149,7 @@ class NotificationService {
       payload: senderId.toString(),
     );
 
-    print('🔔 Notification shown: $senderName - $body');
+    debugPrint('🔔 Notification shown: $senderName - $body');
   }
 
   /// Убрать уведомления от конкретного юзера (когда открыли чат)

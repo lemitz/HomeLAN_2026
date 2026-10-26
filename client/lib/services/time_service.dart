@@ -1,3 +1,5 @@
+import 'package:flutter/foundation.dart';
+
 /// Сервис синхронизации времени с сервером
 /// Решает проблему дрифта часов на устройствах
 class TimeService {
@@ -23,10 +25,10 @@ class TimeService {
     final localTime = DateTime.now().millisecondsSinceEpoch ~/ 1000;
     _timeDelta = serverTime - localTime;
     _lastSync = DateTime.now();
-    
+
     if (_timeDelta.abs() > 5) {
       // Логируем если дрифт больше 5 секунд
-      print('⏰ Time synced: delta = $_timeDelta seconds');
+      debugPrint('⏰ Time synced: delta = $_timeDelta seconds');
     }
   }
 

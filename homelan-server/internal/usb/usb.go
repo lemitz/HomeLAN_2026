@@ -31,36 +31,34 @@ type MasterKey struct {
 
 // FindMasterKey ищет флешку с ключом
 func FindMasterKey() (*MasterKey, error) {
-	drives := getMountedDrives()
-
-	for _, drive := range drives {
+	for _, drive := range getMountedDrives() {
 		keyPath := filepath.Join(drive, KeyFileName)
-
 		if _, err := os.Stat(keyPath); err == nil {
-			keyHex, err := os.ReadFile(keyPath)
+			mk, err := LoadKeyFile(keyPath)
 			if err != nil {
-				continue
+				return nil, err
 			}
-
-			keyHex = []byte(strings.TrimSpace(string(keyHex)))
-			key, err := hex.DecodeString(string(keyHex))
-			if err != nil {
-				return nil, fmt.Errorf("%w: invalid hex encoding", ErrInvalidKey)
-			}
-
-			if len(key) != KeySize {
-				return nil, fmt.Errorf("%w: expected %d bytes, got %d", ErrInvalidKey, KeySize, len(key))
-			}
-
-			return &MasterKey{
-				Key:     key,
-				KeyPath: keyPath,
-				USBPath: drive,
-			}, nil
+			mk.USBPath = drive
+			return mk, nil
 		}
 	}
-
 	return nil, ErrNoUSBFound
+}
+
+// LoadKeyFile читает ключ из указанного файла (hex, 32 байта).
+func LoadKeyFile(keyPath string) (*MasterKey, error) {
+	keyHex, err := os.ReadFile(keyPath)
+	if err != nil {
+		return nil, fmt.Errorf("read key file: %w", err)
+	}
+	key, err := hex.DecodeString(strings.TrimSpace(string(keyHex)))
+	if err != nil {
+		return nil, fmt.Errorf("%w: invalid hex encoding", ErrInvalidKey)
+	}
+	if len(key) != KeySize {
+		return nil, fmt.Errorf("%w: expected %d bytes, got %d", ErrInvalidKey, KeySize, len(key))
+	}
+	return &MasterKey{Key: key, KeyPath: keyPath, USBPath: filepath.Dir(keyPath)}, nil
 }
 
 // ErrKeyExists — на накопителе уже есть ключ (перезапись уничтожит доступ к БД).

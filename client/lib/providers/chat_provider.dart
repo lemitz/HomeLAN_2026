@@ -1,64 +1,32 @@
 // lib/providers/chat_provider.dart
-
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
+
 import 'package:flutter/material.dart';
-import 'package:flutter/foundation.dart';
 import 'package:mime/mime.dart';
+import 'package:path/path.dart' as p;
+import 'package:path_provider/path_provider.dart';
+import 'package:uuid/uuid.dart';
+
 import '../models/models.dart';
 import '../services/services.dart';
+import 'auth_provider.dart';
 
+/// Переписка с собеседником.
+///
+/// Сервер — источник правды. Клиент хранит кеш шифротекстов и курсор
+/// синхронизации (change_seq). После каждого подключения: досинхронизация
+/// по курсору (включая удаления и статусы), затем отправка outbox.
+/// Расшифрованный текст живёт только в памяти.
 class ChatProvider with ChangeNotifier {
   final WebSocketService _ws;
   final DatabaseService _db;
   final ApiService _api;
   final CryptoService _crypto;
   final NotificationService _notifications;
-  
-  int? _myUserId;
-  final Map<int, List<Message>> _chats = {};
-  final Map<int, String> _usernames = {};
-  StreamSubscription? _wsSubscription;
-  bool _isLoading = false;
-  
-  int? _activeChatUserId;
-  
-  final Map<int, bool> _hasMoreMessages = {};
-  final Map<int, bool> _isLoadingMore = {};
-
-  final Map<int, DateTime> _typingUsers = {};
-  
-  final Map<int, Map<String, dynamic>> _contactSettings = {};
-
-  int _myBubbleColor = Colors.blue.value;
-  int _otherBubbleColor = Colors.grey[800]!.value;
-  
-  bool _notificationsEnabled = true;
-
-  // КЛЮЧЕВОЙ ГЕТТЕР: на Windows без связи — пустые чаты
-  Map<int, List<Message>> get chats {
-    if (Platform.isWindows && !ConnectionService().isConnected) {
-      return {};
-    }
-    return _chats;
-  }
-  
-  Map<int, String> get usernames => _usernames;
-  bool get isLoading => _isLoading;
-  int? get myUserId => _myUserId;
-  
-  int get myBubbleColor => _myBubbleColor;
-  int get otherBubbleColor => _otherBubbleColor;
-  
-  bool get notificationsEnabled => _notificationsEnabled;
-
-  bool isUserTyping(int userId) {
-    final lastTyping = _typingUsers[userId];
-    if (lastTyping == null) return false;
-    return DateTime.now().difference(lastTyping).inSeconds < 3;
-  }
+  AuthProvider? _auth;
 
   ChatProvider({
     required WebSocketService ws,
@@ -71,707 +39,535 @@ class ChatProvider with ChangeNotifier {
         _api = api,
         _crypto = crypto,
         _notifications = notifications {
-    _listenToWebSocket();
-    _listenToConnectionChanges();
-    loadBubbleColors();
-    _loadNotificationSettings();
+    _wsSub = _ws.messages.listen(_onWsMessage);
+    _ws.onConnected = _onConnected;
+    _loadSettings();
   }
 
-  void _listenToConnectionChanges() {
-    if (Platform.isWindows) {
-      ConnectionService().addListener(_onConnectionChanged);
+  StreamSubscription? _wsSub;
+  final _uuid = const Uuid();
+
+  int? _myId;
+  int? _peerId;
+
+  /// Сообщения, новые первыми.
+  List<Message> _messages = [];
+  final Map<String, DecryptedContent> _decrypted = {};
+  final Set<String> _decrypting = {};
+
+  bool _syncing = false;
+  bool _hasMoreHistory = true;
+  bool _loadingHistory = false;
+  bool _chatVisible = false;
+  DateTime? _peerTypingAt;
+
+  int _myBubbleColor = Colors.blue.toARGB32();
+  int _otherBubbleColor = Colors.grey[800]!.toARGB32();
+  bool _notificationsEnabled = true;
+  Map<String, dynamic>? _contact;
+
+  List<Message> get messages => _messages;
+  bool get isSyncing => _syncing;
+  bool get hasMoreHistory => _hasMoreHistory;
+  bool get isLoadingHistory => _loadingHistory;
+  int get myBubbleColor => _myBubbleColor;
+  int get otherBubbleColor => _otherBubbleColor;
+  bool get notificationsEnabled => _notificationsEnabled;
+  int? get myUserId => _myId;
+
+  bool get isPeerTyping => _peerTypingAt != null && DateTime.now().difference(_peerTypingAt!).inSeconds < 4;
+
+  DecryptedContent? decryptedOf(Message m) => _decrypted[m.key];
+
+  int get unreadCount => _messages.where((m) => m.senderId == _peerId && m.readAt == null && !m.isDeleted).length;
+
+  // ============ ЖИЗНЕННЫЙ ЦИКЛ ============
+
+  /// Вызывается из ProxyProvider при изменении авторизации.
+  void attachAuth(AuthProvider auth) {
+    _auth = auth;
+    final me = auth.isLoggedIn ? auth.userId : null;
+    final peer = auth.isLoggedIn ? auth.partnerId : null;
+    if (me == _myId && peer == _peerId) return;
+
+    if (me == null) {
+      _reset();
+      return;
     }
+    final firstStart = _myId != me;
+    _myId = me;
+    _peerId = peer;
+    if (firstStart) {
+      _reset(keepIds: true);
+      _loadFromCache();
+    } else {
+      _decryptAll();
+    }
+    if (_ws.isConnected) _onConnected();
   }
 
-  void _onConnectionChanged() {
-    // При изменении состояния соединения — обновляем UI
+  void _reset({bool keepIds = false}) {
+    if (!keepIds) {
+      _myId = null;
+      _peerId = null;
+    }
+    _messages = [];
+    _decrypted.clear();
+    _decrypting.clear();
+    _hasMoreHistory = true;
+    _syncing = false;
+    _contact = null;
     notifyListeners();
   }
 
-  void setUserId(int userId) {
-    _myUserId = userId;
-    print('ChatProvider: setUserId=$userId');
-    _loadAllDataFromDB(); 
-    _syncMessages();
-  }
-
-  Future<void> _loadAllDataFromDB() async {
-    if (_myUserId == null) return;
-    
-    print('📂 Loading all data from local DB...');
-    
-    final savedUsernames = await _db.getAllUsernames();
-    _usernames.addAll(savedUsernames);
-    print('📂 Loaded ${savedUsernames.length} usernames');
-    
-    final savedContacts = await _db.getAllContacts();
-    _contactSettings.addAll(savedContacts);
-    print('📂 Loaded ${savedContacts.length} contact settings');
-    
-    final chatUserIds = await _db.getAllChatUserIds(_myUserId!);
-    print('📂 Found ${chatUserIds.length} chats in DB');
-    
-    for (final oderId in chatUserIds) {
-      final messages = await _db.getMessages(oderId, _myUserId!);
-      if (messages.isNotEmpty) {
-        _chats[oderId] = messages;
-      }
-    }
-    
+  Future<void> _loadFromCache() async {
+    final cached = await _db.recentMessages(limit: 200);
+    if (_myId == null) return;
+    _messages = cached;
+    if (_peerId != null) _contact = await _db.getContact(_peerId!);
     notifyListeners();
+    _decryptAll();
   }
 
-  void setActiveChat(int? userId) {
-    _activeChatUserId = userId;
-    
-    if (userId != null) {
-      _notifications.cancelNotificationsFromUser(userId);
+  /// Видимость экрана чата (для отметок «прочитано» и уведомлений).
+  void setChatVisible(bool visible) {
+    _chatVisible = visible;
+    if (visible) {
+      if (_peerId != null) _notifications.cancelNotificationsFromUser(_peerId!);
+      markRead();
     }
   }
 
-  Future<void> _ensureUserPublicKey(int userId) async {
-    if (_crypto.hasUserPublicKey(userId)) return;
-    
-    try {
-      final userData = await _api.getUser(userId);
-      if (userData['public_key'] != null) {
-        final publicKeyBase64 = userData['public_key'] as String;
-        _crypto.setUserPublicKeyBase64(userId, publicKeyBase64);
-        print('🔐 Fetched public key for user $userId');
-      }
-    } catch (e) {
-      print('Failed to fetch public key for user $userId: $e');
-    }
+  void _onConnected() {
+    if (_myId == null) return;
+    _sync();
   }
 
-  void _listenToWebSocket() {
-    _wsSubscription = _ws.messages.listen((message) {
-      final type = message['type'];
-      final data = message['data'];
+  // ============ СИНХРОНИЗАЦИЯ ============
 
-      print('WS received: $type');
-      
-      // Уведомляем ConnectionService о сообщении
-      if (Platform.isWindows) {
-        ConnectionService().onServerMessage();
-      }
-
-      switch (type) {
-        case 'new_message':
-          _handleNewMessage(data);
-          break;
-        case 'message_sent':
-          _handleMessageSent(data);
-          break;
-        case 'sync_response':
-          _handleSyncResponse(data);
-          break;
-        case 'status_update':
-          _handleStatusUpdate(data);
-          break;
-        case 'message_deleted':
-          _handleMessageDeleted(data);
-          break;
-        case 'user_typing':
-          _handleUserTyping(data);
-          break;
-      }
-    });
-  }
-
-  Future<void> _handleNewMessage(Map<String, dynamic> data) async {
-    final message = Message.fromJson(data);
-
-    final oderId = message.senderId == _myUserId
-        ? message.recipientId
-        : message.senderId;
-
-    print('New message: seq=${message.seqId} from=${message.senderId} to=${message.recipientId}');
-
-    _chats[oderId] ??= [];
-
-    final exists = _chats[oderId]!.any((m) => m.seqId == message.seqId);
-    if (!exists) {
-      final messageWithStatus = message.senderId != _myUserId
-          ? message.copyWith(status: 'delivered')
-          : message;
-      
-      _chats[oderId]!.insert(0, messageWithStatus);
-      _db.insertMessage(messageWithStatus);
-      _ws.ack(message.seqId);
-
-      if (message.senderId != _myUserId) {
-        _typingUsers.remove(message.senderId);
-      }
-
-      if (message.senderId != _myUserId && _activeChatUserId != message.senderId) {
-        await _showNotificationForMessage(message);
-      }
-
-      if (message.senderId != _myUserId && _activeChatUserId == message.senderId) {
-        markAsRead(message.seqId);
-      }
-    }
-
+  Future<void> _sync() async {
+    if (_syncing) return;
+    _syncing = true;
     notifyListeners();
+    final cursor = await _db.getSyncCursor();
+    if (!_ws.send('sync', {'since': cursor, 'limit': 200})) {
+      _syncing = false;
+      notifyListeners();
+    }
   }
 
-  void _handleUserTyping(Map<String, dynamic> data) {
-    final userId = data['user_id'] as int;
-    _typingUsers[userId] = DateTime.now();
+  Future<void> _onSyncResponse(Map<String, dynamic> data) async {
+    final list = (data['messages'] as List? ?? []).cast<Map<String, dynamic>>();
+    for (final json in list) {
+      await _applyServerMessage(Message.fromServer(json), fromSync: true);
+    }
+    final cursor = data['cursor'] as int? ?? 0;
+    if (cursor > 0) await _db.setSyncCursor(cursor);
+
+    if (data['has_more'] == true) {
+      _ws.send('sync', {'since': cursor, 'limit': 200});
+      return;
+    }
+    _syncing = false;
     notifyListeners();
-    
-    Future.delayed(const Duration(seconds: 3), () {
-      if (_typingUsers[userId]?.isBefore(
-        DateTime.now().subtract(const Duration(seconds: 3))
-      ) ?? false) {
-        _typingUsers.remove(userId);
-        notifyListeners();
-      }
-    });
+    await _flushOutbox();
+    _ackUndelivered();
+    if (_chatVisible) markRead();
   }
 
-  Future<void> _showNotificationForMessage(Message message) async {
-    if (!_notificationsEnabled) return;
+  Future<void> _applyServerMessage(Message incoming, {bool fromSync = false}) async {
+    if (_myId == null) return;
+    final stored = await _db.upsertServerMessage(incoming);
+    final idx = _messages.indexWhere((m) => m.key == stored.key);
+    final isNew = idx < 0;
 
-    try {
-      final senderId = message.senderId;
-      final senderName = getContactName(senderId, _usernames[senderId] ?? 'User $senderId');
-      
-      String messageText = '';
-      bool isImage = false;
-      bool isFile = false;
-      
-      if (message.contentType.contains('image')) {
-        isImage = true;
-      } else if (message.contentType.contains('file')) {
-        isFile = true;
+    if (stored.isDeleted) {
+      if (!isNew) _messages.removeAt(idx);
+      _decrypted.remove(stored.key);
+      notifyListeners();
+      return;
+    }
+
+    if (isNew) {
+      _messages.insert(_insertIndex(stored), stored);
+    } else {
+      _messages[idx] = stored;
+    }
+    notifyListeners();
+    await _decrypt(stored);
+
+    final incomingFromPeer = stored.senderId != _myId;
+    if (incomingFromPeer && stored.deliveredAt == null && !fromSync) {
+      _ws.send('ack', {'seq_id': stored.seqId});
+    }
+    if (incomingFromPeer && isNew && !fromSync) {
+      _peerTypingAt = null;
+      if (_chatVisible) {
+        markRead();
       } else {
-        try {
-          messageText = await decryptMessage(message);
-          if (messageText.startsWith('[')) {
-            messageText = 'Новое сообщение';
-          }
-        } catch (e) {
-          messageText = 'Новое сообщение';
-        }
+        _notify(stored);
       }
-      
-      await _notifications.showMessageNotification(
-        senderId: senderId,
-        senderName: senderName,
-        messageText: messageText,
-        isImage: isImage,
-        isFile: isFile,
-      );
-    } catch (e) {
-      print('Failed to show notification: $e');
     }
   }
 
-  void _handleMessageSent(Map<String, dynamic> data) {
-    final seqId = data['seq_id'] as int;
-    
-    print('Message sent confirmed: seq=$seqId');
-    
-    for (var oderId in _chats.keys) {
-      final messages = _chats[oderId]!;
-      for (var i = 0; i < messages.length; i++) {
-        if (messages[i].status == 'pending' && messages[i].seqId == 0) {
-          final updatedMessage = messages[i].copyWith(
-            seqId: seqId,
-            status: 'sent',
-          );
-          messages[i] = updatedMessage;
-          _db.insertMessage(updatedMessage);
-          print('Updated pending message to seq=$seqId');
-          break;
-        }
+  int _insertIndex(Message m) {
+    for (var i = 0; i < _messages.length; i++) {
+      final other = _messages[i];
+      if (other.createdAt < m.createdAt ||
+          (other.createdAt == m.createdAt && (other.seqId ?? 1 << 62) < (m.seqId ?? 1 << 62))) {
+        return i;
       }
     }
-    
+    return _messages.length;
+  }
+
+  void _ackUndelivered() {
+    for (final m in _messages) {
+      if (m.senderId != _myId && m.deliveredAt == null && m.seqId != null) {
+        _ws.send('ack', {'seq_id': m.seqId});
+      }
+    }
+  }
+
+  /// Отмечает прочитанными все входящие сообщения.
+  void markRead() {
+    if (_myId == null) return;
+    int maxSeq = 0;
+    for (final m in _messages) {
+      if (m.senderId != _myId && m.readAt == null && (m.seqId ?? 0) > maxSeq) maxSeq = m.seqId!;
+    }
+    if (maxSeq > 0) _ws.send('read', {'up_to_seq': maxSeq});
+  }
+
+  /// Загрузка более старых сообщений: сначала из кеша, потом с сервера.
+  Future<void> loadOlder() async {
+    if (_loadingHistory || !_hasMoreHistory || _messages.isEmpty) return;
+    _loadingHistory = true;
     notifyListeners();
+    final oldest = _messages.last;
+    final cached = await _db.recentMessages(limit: 100, beforeCreatedAt: oldest.createdAt);
+    final known = _messages.map((m) => m.key).toSet();
+    final fresh = cached.where((m) => !known.contains(m.key)).toList();
+    if (fresh.isNotEmpty) {
+      _messages.addAll(fresh);
+      _loadingHistory = false;
+      notifyListeners();
+      _decryptAll();
+      return;
+    }
+    final oldestSeq = _messages
+        .where((m) => m.seqId != null)
+        .map((m) => m.seqId!)
+        .fold<int?>(null, (a, b) => a == null || b < a ? b : a);
+    if (oldestSeq == null || !_ws.send('history', {'before_seq': oldestSeq, 'limit': 50})) {
+      _loadingHistory = false;
+      notifyListeners();
+    }
   }
 
-  Future<void> _handleSyncResponse(Map<String, dynamic> data) async {
-    final messagesList = data['messages'] as List? ?? [];
-    
-    print('Sync response: ${messagesList.length} messages');
-    
-    for (var m in messagesList) {
-      final message = Message.fromJson(m);
-      
-      final oderId = message.senderId == _myUserId 
-          ? message.recipientId 
-          : message.senderId;
-      
-      if (message.isDeleted) {
-        _chats[oderId]?.removeWhere((msg) => msg.seqId == message.seqId);
-        _db.deleteMessage(message.seqId);
-        continue;
-      }
-
-      _chats[oderId] ??= [];
-      
-      final exists = _chats[oderId]!.any((msg) => msg.seqId == message.seqId);
-      if (!exists) {
-        _chats[oderId]!.add(message);
-        _db.insertMessage(message);
+  Future<void> _onHistoryResponse(Map<String, dynamic> data) async {
+    final list = (data['messages'] as List? ?? []).cast<Map<String, dynamic>>();
+    for (final json in list) {
+      final m = Message.fromServer(json);
+      final stored = await _db.upsertServerMessage(m);
+      if (!_messages.any((x) => x.key == stored.key) && !stored.isDeleted) {
+        _messages.insert(_insertIndex(stored), stored);
       }
     }
-    
-    for (var oderId in _chats.keys) {
-      _chats[oderId]!.sort((a, b) => b.createdAt.compareTo(a.createdAt));
-    }
-    
-    _isLoading = false;
-
-    if (messagesList.length < 50) {
-      for (var oderId in _chats.keys) {
-        _hasMoreMessages[oderId] = false;
-      }
-    }
-
+    _hasMoreHistory = data['has_more'] == true;
+    _loadingHistory = false;
     notifyListeners();
+    _decryptAll();
   }
 
-  void _handleStatusUpdate(Map<String, dynamic> data) {
-    final seqId = data['seq_id'] as int;
-    final status = data['status'] as String;
-    
-    print('Status update: seq=$seqId status=$status');
-    
-    for (var messages in _chats.values) {
-      for (var i = 0; i < messages.length; i++) {
-        if (messages[i].seqId == seqId) {
-          messages[i] = messages[i].copyWith(status: status);
-          _db.updateMessageStatus(seqId, status);
+  // ============ WEBSOCKET ============
+
+  void _onWsMessage(Map<String, dynamic> msg) {
+    final data = msg['data'];
+    if (data is! Map<String, dynamic>) return;
+    switch (msg['type']) {
+      case 'message':
+        _applyServerMessage(Message.fromServer(data));
+        break;
+      case 'message_sent':
+        _onMessageSent(data);
+        break;
+      case 'send_failed':
+        _onSendFailed(data);
+        break;
+      case 'sync_response':
+        _onSyncResponse(data);
+        break;
+      case 'history_response':
+        _onHistoryResponse(data);
+        break;
+      case 'typing':
+        if (data['user_id'] == _peerId) {
+          _peerTypingAt = DateTime.now();
           notifyListeners();
-          return;
+          Future.delayed(const Duration(seconds: 4), notifyListeners);
         }
-      }
+        break;
     }
   }
 
-  void _handleMessageDeleted(Map<String, dynamic> data) {
-    final seqId = data['seq_id'] as int;
-    
-    for (var messages in _chats.values) {
-      messages.removeWhere((m) => m.seqId == seqId);
-    }
-    
-    _db.deleteMessage(seqId);
-    notifyListeners();
-  }
-
-  Future<void> _syncMessages() async {
-    if (_myUserId == null) return;
-    
-    _isLoading = true;
-    notifyListeners();
-    
-    final lastSeqId = await _db.getLastSeqId();
-    print('Syncing from seq_id=$lastSeqId');
-    _ws.sync(sinceSeqId: lastSeqId);
-  }
-
-  Future<void> loadLocalMessages(int oderId) async {
-    if (_myUserId == null) {
-      print('loadLocalMessages: myUserId is null!');
-      return;
-    }
-    
-    print('loadLocalMessages: oderId=$oderId myUserId=$_myUserId');
-    
-    await _db.printAllMessages();
-    
-    final messages = await _db.getMessages(oderId, _myUserId!);
-    
-    print('Loaded ${messages.length} messages from local DB');
-    
-    if (messages.isNotEmpty) {
-      _chats[oderId] = messages;
+  void _onMessageSent(Map<String, dynamic> data) {
+    // Полное состояние приходит отдельным событием "message";
+    // здесь только снимаем pending-статус на случай, если оно задержится.
+    final clientId = data['client_id'] as String?;
+    final idx = _messages.indexWhere((m) => m.senderId == _myId && m.clientId == clientId);
+    if (idx >= 0 && _messages[idx].localStatus != LocalStatus.sent) {
+      _messages[idx] = _messages[idx].copyWith(localStatus: LocalStatus.sent);
       notifyListeners();
     }
   }
 
-  Future<void> sendMessage(int recipientId, String content) async {
-    if (_myUserId == null) return;
-    
-    // Проверка связи на Windows
-    if (Platform.isWindows && !ConnectionService().isConnected) {
-      print('❌ Cannot send: server disconnected');
-      return;
-    }
-    
-    await _ensureUserPublicKey(recipientId);
-    
-    Uint8List encryptedContent;
-    
-    if (_crypto.hasUserPublicKey(recipientId)) {
-      try {
-        encryptedContent = await _crypto.encrypt(content, recipientId);
-        print('🔐 Message encrypted for user $recipientId');
-      } catch (e) {
-        print('Encryption failed: $e, sending as plain text');
-        encryptedContent = Uint8List.fromList(utf8.encode(content));
-      }
-    } else {
-      print('⚠️ No public key for user $recipientId, sending unencrypted');
-      encryptedContent = Uint8List.fromList(utf8.encode(content));
-    }
-    
-    final tempMessage = Message(
-      seqId: 0,
-      senderId: _myUserId!,
-      recipientId: recipientId,
-      encryptedContent: encryptedContent,
-      contentType: _crypto.hasUserPublicKey(recipientId) ? 'encrypted' : 'text',
-      createdAt: TimeService().getNow(),
-      status: 'pending',
-    );
-    
-    _chats[recipientId] ??= [];
-    _chats[recipientId]!.insert(0, tempMessage);
+  Future<void> _onSendFailed(Map<String, dynamic> data) async {
+    final clientId = data['client_id'] as String?;
+    final idx = _messages.indexWhere((m) => m.senderId == _myId && m.clientId == clientId);
+    if (idx < 0) return;
+    final m = _messages[idx];
+    final reason = data['message'] as String? ?? data['code'] as String?;
+    _messages[idx] = m.copyWith(localStatus: LocalStatus.failed, failReason: reason);
+    if (m.localId != null) await _db.setLocalStatus(m.localId!, LocalStatus.failed, reason: reason);
     notifyListeners();
-    
-    _ws.sendEncryptedMessage(
-      recipientId: recipientId,
-      encryptedContent: encryptedContent,
-      contentType: tempMessage.contentType,
-    );
   }
 
-  Future<void> sendFile({
-    required int recipientId,
-    required File file,
-    required String fileName,
-    bool isImage = false,
-    void Function(double progress)? onProgress,
-  }) async {
-    if (_myUserId == null) return;
-    
-    // Проверка связи на Windows
-    if (Platform.isWindows && !ConnectionService().isConnected) {
-      print('❌ Cannot send file: server disconnected');
-      return;
+  // ============ ОТПРАВКА ============
+
+  void _requireKey() {
+    if (_myId == null || _peerId == null) throw StateError('Собеседник ещё не подключён');
+    final status = _crypto.peerStatus(_peerId!);
+    if (status == PeerKeyStatus.mismatch) {
+      throw CryptoException('Ключ собеседника изменился. Сверьте отпечаток в настройках чата');
     }
+    if (status == PeerKeyStatus.unknown) throw CryptoException('Нет ключа собеседника');
+  }
 
-    print('📎 Sending file: $fileName to user $recipientId');
+  Future<void> sendText(String text) async {
+    _requireKey();
+    await _enqueue(contentType: 'text', plaintext: Uint8List.fromList(utf8.encode(text)));
+  }
 
-    await _ensureUserPublicKey(recipientId);
-
-    final fileBytes = await file.readAsBytes();
-    final mimeType = lookupMimeType(fileName) ?? 'application/octet-stream';
-    
-    print('📎 File size: ${fileBytes.length} bytes, mime: $mimeType');
-
-    Uint8List encryptedFileData;
-    String contentType;
-
-    if (_crypto.hasUserPublicKey(recipientId)) {
-      try {
-        encryptedFileData = await _crypto.encryptBytes(fileBytes, recipientId);
-        contentType = isImage ? 'encrypted_image' : 'encrypted_file';
-        print('🔐 File encrypted: ${encryptedFileData.length} bytes');
-      } catch (e) {
-        print('File encryption failed: $e');
-        throw Exception('Не удалось зашифровать файл');
-      }
-    } else {
-      print('⚠️ No public key, cannot send file securely');
-      throw Exception('Нет ключа шифрования для получателя');
-    }
-
-    onProgress?.call(0.1);
-    
-    final uploadResult = await _api.uploadFile(
-      userId: _myUserId!,
-      file: file,
-      fileName: fileName,
-      encryptedData: encryptedFileData,
-      mimeType: mimeType,
-      onProgress: (p) => onProgress?.call(0.1 + p * 0.8),
-    );
-
-    final fileId = uploadResult['file_id'] as String;
-    print('📎 File uploaded: $fileId');
-
-    onProgress?.call(0.95);
-
-    final metadata = {
-      'file_name': fileName,
-      'file_size': fileBytes.length,
-      'mime_type': mimeType,
-      'is_image': isImage,
-    };
-
-    final encryptedMetadata = await _crypto.encrypt(
-      jsonEncode(metadata),
-      recipientId,
-    );
-
-    final tempMessage = Message(
-      seqId: 0,
-      senderId: _myUserId!,
-      recipientId: recipientId,
-      encryptedContent: encryptedMetadata,
+  Future<void> _enqueue({required String contentType, required Uint8List plaintext, String? fileId}) async {
+    final clientId = _uuid.v4();
+    final encrypted = await _crypto.encryptMessage(
+      plaintext: plaintext,
+      myId: _myId!,
+      peerId: _peerId!,
       contentType: contentType,
+      clientId: clientId,
+    );
+    var msg = Message(
+      clientId: clientId,
+      senderId: _myId!,
+      recipientId: _peerId!,
+      contentType: contentType,
+      encryptedContent: encrypted,
       fileId: fileId,
       createdAt: TimeService().getNow(),
-      status: 'pending',
+      localStatus: LocalStatus.pending,
     );
-
-    _chats[recipientId] ??= [];
-    _chats[recipientId]!.insert(0, tempMessage);
+    msg = await _db.insertPending(msg);
+    _messages.insert(0, msg);
+    _decrypted[msg.key] = contentType == 'text'
+        ? DecryptedContent.text(utf8.decode(plaintext))
+        : DecryptedContent.file(FileMeta.fromJson(jsonDecode(utf8.decode(plaintext))));
     notifyListeners();
+    _transmit(msg);
+  }
 
-    _ws.sendEncryptedMessage(
-      recipientId: recipientId,
-      encryptedContent: encryptedMetadata,
-      contentType: contentType,
-      fileId: fileId,
+  void _transmit(Message m) {
+    _ws.send('send_message', {
+      'client_id': m.clientId,
+      'recipient_id': m.recipientId,
+      'content_type': m.contentType,
+      'encrypted_content': base64Encode(m.encryptedContent),
+      if (m.fileId != null) 'file_id': m.fileId,
+      if (m.expiresAt != null) 'expires_at': m.expiresAt,
+    });
+  }
+
+  /// Отправляет все неотправленные сообщения (сервер дедуплицирует по client_id).
+  Future<void> _flushOutbox() async {
+    if (_myId == null) return;
+    for (final m in await _db.pendingMessages(_myId!)) {
+      _transmit(m);
+    }
+  }
+
+  /// Повторная отправка сообщения с ошибкой.
+  Future<void> retry(Message m) async {
+    if (m.localId == null) return;
+    await _db.setLocalStatus(m.localId!, LocalStatus.pending);
+    final idx = _messages.indexWhere((x) => x.key == m.key);
+    final updated = m.copyWith(localStatus: LocalStatus.pending);
+    if (idx >= 0) _messages[idx] = updated;
+    notifyListeners();
+    _transmit(updated);
+  }
+
+  /// Удаляет неотправленное сообщение локально.
+  Future<void> discard(Message m) async {
+    if (m.seqId != null || m.localId == null) return;
+    await _db.deleteLocal(m.localId!);
+    _messages.removeWhere((x) => x.key == m.key);
+    _decrypted.remove(m.key);
+    notifyListeners();
+  }
+
+  /// Шифрует файл потоком, загружает и отправляет сообщение с метаданными.
+  Future<void> sendFile(File file, {bool isImage = false, void Function(double)? onProgress}) async {
+    _requireKey();
+    final name = p.basename(file.path);
+    final size = await file.length();
+    final key = FileCipher.newKey();
+    final tmpDir = await getTemporaryDirectory();
+    final encPath = p.join(tmpDir.path, 'upload_${_uuid.v4()}.hlf');
+    try {
+      onProgress?.call(0);
+      await FileCipher.encrypt(file.path, encPath, key);
+      final fileId = await _api.uploadFile(encPath, onProgress: (v) => onProgress?.call(v));
+      final meta = FileMeta(name: name, size: size, mime: lookupMimeType(name) ?? 'application/octet-stream', key: key);
+      await _enqueue(
+        contentType: isImage ? 'image' : 'file',
+        plaintext: Uint8List.fromList(utf8.encode(jsonEncode(meta.toJson()))),
+        fileId: fileId,
+      );
+    } finally {
+      final f = File(encPath);
+      if (await f.exists()) await f.delete();
+    }
+  }
+
+  /// Скачивает и расшифровывает файл во временную папку приложения.
+  /// Возвращает путь к расшифрованному файлу.
+  Future<String> downloadFile(Message m, {void Function(double)? onProgress}) async {
+    final meta = _decrypted[m.key]?.file;
+    if (meta == null || m.fileId == null) throw StateError('Нет данных файла');
+    final dir = await decryptedFilesDir();
+    final out = p.join(dir.path, '${m.seqId ?? m.clientId}_${safeFileName(meta.name)}');
+    if (await File(out).exists()) return out;
+
+    final encPath = '$out.download';
+    try {
+      await _api.downloadFile(m.fileId!, encPath, onProgress: onProgress);
+      await FileCipher.decrypt(encPath, out, meta.key);
+    } finally {
+      final f = File(encPath);
+      if (await f.exists()) await f.delete();
+    }
+    return out;
+  }
+
+  /// Папка расшифрованных файлов. Очищается при запуске и выходе.
+  static Future<Directory> decryptedFilesDir() async {
+    final dir = Directory(p.join((await getTemporaryDirectory()).path, 'homelan_files'));
+    if (!await dir.exists()) await dir.create(recursive: true);
+    return dir;
+  }
+
+  static Future<void> clearDecryptedFiles() async {
+    final dir = Directory(p.join((await getTemporaryDirectory()).path, 'homelan_files'));
+    if (await dir.exists()) await dir.delete(recursive: true);
+  }
+
+  /// Имя файла без путей и опасных символов.
+  static String safeFileName(String name) {
+    var base = p.basename(name.replaceAll('\\', '/'));
+    base = base.replaceAll(RegExp(r'[<>:"/\\|?*\x00-\x1F]'), '_').trim();
+    if (base.isEmpty || base == '.' || base == '..') base = 'file';
+    return base.length > 120 ? base.substring(base.length - 120) : base;
+  }
+
+  void deleteMessage(Message m) {
+    if (m.seqId == null) {
+      discard(m);
+      return;
+    }
+    _ws.send('delete', {'seq_id': m.seqId});
+  }
+
+  DateTime? _lastTypingSent;
+  void sendTyping() {
+    if (_peerId == null) return;
+    final now = DateTime.now();
+    if (_lastTypingSent != null && now.difference(_lastTypingSent!).inSeconds < 3) return;
+    _lastTypingSent = now;
+    _ws.send('typing', {'recipient_id': _peerId});
+  }
+
+  // ============ РАСШИФРОВКА ============
+
+  void _decryptAll() {
+    for (final m in _messages) {
+      _decrypt(m);
+    }
+  }
+
+  Future<void> _decrypt(Message m) async {
+    if (_myId == null || _peerId == null) return;
+    final existing = _decrypted[m.key];
+    if ((existing != null && !existing.isError) || _decrypting.contains(m.key)) return;
+    _decrypting.add(m.key);
+    try {
+      final clear = await _crypto.decryptMessage(
+        blob: m.encryptedContent,
+        myId: _myId!,
+        peerId: _peerId!,
+        senderId: m.senderId,
+        recipientId: m.recipientId,
+        contentType: m.contentType,
+        clientId: m.clientId,
+      );
+      final text = utf8.decode(clear);
+      _decrypted[m.key] = m.isFile
+          ? DecryptedContent.file(FileMeta.fromJson(jsonDecode(text) as Map<String, dynamic>))
+          : DecryptedContent.text(text);
+    } catch (e) {
+      _decrypted[m.key] = DecryptedContent.error(e is CryptoException ? e.message : 'Не удалось расшифровать');
+    } finally {
+      _decrypting.remove(m.key);
+    }
+    notifyListeners();
+  }
+
+  Future<void> _notify(Message m) async {
+    if (!_notificationsEnabled || _peerId == null) return;
+    final d = _decrypted[m.key];
+    final name = contactName(_auth?.partnerUsername ?? 'Собеседник');
+    await _notifications.showMessageNotification(
+      senderId: m.senderId,
+      senderName: name,
+      messageText: d?.text ?? 'Новое сообщение',
+      isImage: m.isImage,
+      isFile: m.contentType == 'file',
     );
-
-    onProgress?.call(1.0);
-    print('📎 File message sent!');
   }
 
-  Future<Uint8List> downloadFile(Message message) async {
-    if (message.fileId == null || message.fileId!.isEmpty) {
-      throw Exception('No file ID');
-    }
-    
-    // Проверка связи на Windows
-    if (Platform.isWindows && !ConnectionService().isConnected) {
-      throw Exception('Сервер недоступен');
-    }
+  // ============ ПОИСК ============
 
-    print('📥 Downloading file: ${message.fileId}');
-
-    final encryptedData = await _api.downloadFile(message.fileId!);
-    
-    final senderId = message.senderId == _myUserId 
-        ? message.recipientId 
-        : message.senderId;
-
-    await _ensureUserPublicKey(senderId);
-
-    if (!_crypto.hasUserPublicKey(senderId)) {
-      throw Exception('Нет ключа для расшифровки');
-    }
-
-    final decryptedData = await _crypto.decryptBytes(encryptedData, senderId);
-    
-    print('📥 File decrypted: ${decryptedData.length} bytes');
-    return decryptedData;
+  /// Поиск по расшифрованному тексту (поддерживается * и ?).
+  List<Message> search(String query) {
+    if (query.trim().isEmpty) return [];
+    final pattern = RegExp.escape(query.trim()).replaceAll(r'\*', '.*').replaceAll(r'\?', '.');
+    final re = RegExp(pattern, caseSensitive: false);
+    return _messages.where((m) {
+      final d = _decrypted[m.key];
+      final text = d?.text ?? d?.file?.name;
+      return text != null && re.hasMatch(text);
+    }).toList();
   }
 
-  Future<Map<String, dynamic>?> getFileMetadata(Message message) async {
-    if (!message.contentType.contains('file') && !message.contentType.contains('image')) {
-      return null;
-    }
+  // ============ НАСТРОЙКИ ============
 
-    try {
-      final decrypted = await decryptMessage(message);
-      return jsonDecode(decrypted) as Map<String, dynamic>;
-    } catch (e) {
-      print('Failed to get file metadata: $e');
-      return null;
-    }
-  }
-
-  Future<String> decryptMessage(Message message) async {
-    if (message.contentType != 'encrypted' && 
-        !message.contentType.startsWith('encrypted_')) {
-      return message.textContent;
-    }
-    
-    final senderId = message.senderId == _myUserId 
-        ? message.recipientId 
-        : message.senderId;
-    
-    await _ensureUserPublicKey(senderId);
-    
-    if (!_crypto.hasUserPublicKey(senderId)) {
-      return '[Не удалось расшифровать]';
-    }
-    
-    try {
-      return await _crypto.decrypt(message.encryptedContent, senderId);
-    } catch (e) {
-      print('Decryption failed: $e');
-      return '[Ошибка расшифровки]';
-    }
-  }
-
-  void deleteMessage(int seqId) {
-    if (Platform.isWindows && !ConnectionService().isConnected) return;
-    _ws.deleteMessage(seqId);
-  }
-
-  void markAsRead(int seqId) {
-    if (Platform.isWindows && !ConnectionService().isConnected) return;
-    print('📖 Marking as read: seq=$seqId');
-    _ws.markRead(seqId);
-  }
-
-  void markChatAsRead(int oderId) {
-    if (_myUserId == null) return;
-    if (Platform.isWindows && !ConnectionService().isConnected) return;
-    
-    final messages = _chats[oderId];
-    if (messages == null || messages.isEmpty) return;
-    
-    final unreadIncoming = messages
-        .where((m) => m.senderId != _myUserId && m.status != 'read' && m.seqId > 0)
-        .toList();
-    
-    if (unreadIncoming.isEmpty) return;
-    
-    int maxSeqId = 0;
-    for (final msg in unreadIncoming) {
-      if (msg.seqId > maxSeqId) {
-        maxSeqId = msg.seqId;
-      }
-    }
-    
-    print('📖 Marking chat $oderId as read up to seq=$maxSeqId (${unreadIncoming.length} messages)');
-    
-    _ws.markRead(maxSeqId);
-    
-    for (var i = 0; i < messages.length; i++) {
-      final msg = messages[i];
-      if (msg.senderId != _myUserId && msg.status != 'read' && msg.seqId <= maxSeqId) {
-        messages[i] = msg.copyWith(status: 'read');
-        _db.updateMessageStatus(msg.seqId, 'read');
-      }
-    }
-    
-    notifyListeners();
-  }
-
-  int getUnreadCount(int oderId) {
-    if (_myUserId == null) return 0;
-    
-    final messages = _chats[oderId];
-    if (messages == null) return 0;
-    
-    return messages
-        .where((m) => m.senderId != _myUserId && m.status != 'read')
-        .length;
-  }
-
-  Future<void> deleteChat(int userId) async {
-    _chats.remove(userId);
-    _usernames.remove(userId);
-    
-    await _db.deleteMessagesForUser(userId);
-    
-    print('🗑️ Deleted chat with user $userId');
-    notifyListeners();
-  }
-
-  void addUser(int userId, String username) {
-    _usernames[userId] = username;
-    _db.saveUsername(userId, username);
-    _ensureUserPublicKey(userId);
-    notifyListeners();
-  }
-
-  List<int> getChatUserIds() {
-    return _chats.keys.toList();
-  }
-
-  Future<List<Message>> searchMessages(int oderId, String query) async {
-    if (query.isEmpty) return [];
-    
-    // На Windows без связи — пустой поиск
-    if (Platform.isWindows && !ConnectionService().isConnected) {
-      return [];
-    }
-    
-    final messages = _chats[oderId];
-    if (messages == null) return [];
-    
-    final pattern = query
-        .replaceAll(RegExp(r'[.+^${}()|[\]\\]'), r'\$&')
-        .replaceAll('*', '.*')
-        .replaceAll('?', '.');
-    
-    final regex = RegExp(pattern, caseSensitive: false);
-    
-    final results = <Message>[];
-    
-    for (final msg in messages) {
-      if (msg.contentType.contains('file') || msg.contentType.contains('image')) {
-        continue;
-      }
-      
-      String text;
-      if (msg.contentType == 'encrypted' || msg.contentType.startsWith('encrypted_')) {
-        try {
-          text = await decryptMessage(msg);
-          if (text.startsWith('[')) continue;
-        } catch (e) {
-          continue;
-        }
-      } else {
-        text = msg.textContent;
-      }
-      
-      if (regex.hasMatch(text.toLowerCase())) {
-        results.add(msg);
-      }
-    }
-    
-    return results;
-  }
-
-  void sendTyping(int recipientId) {
-    if (Platform.isWindows && !ConnectionService().isConnected) return;
-    _ws.sendTyping(recipientId);
-  }
-
-  Future<void> loadContactSettings(int userId) async {
-    final contact = await _db.getContact(userId);
-    if (contact != null) {
-      _contactSettings[userId] = contact;
-      notifyListeners();
-    }
-  }
-
-  String getContactName(int userId, String defaultName) {
-    final customName = _contactSettings[userId]?['custom_name'] as String?;
-    return (customName != null && customName.isNotEmpty) ? customName : defaultName;
-  }
-
-  int getContactAvatarColor(int userId) {
-    return _contactSettings[userId]?['custom_avatar_color'] as int? ?? Colors.blue.value;
-  }
-
-  Future<void> saveContactSettings(int userId, String? customName, int? avatarColor) async {
-    await _db.saveContact(userId, customName, avatarColor);
-    _contactSettings[userId] = {
-      'custom_name': customName,
-      'custom_avatar_color': avatarColor,
-    };
-    notifyListeners();
-  }
-  
-  Future<void> loadBubbleColors() async {
-    final myColor = await _db.getSetting('my_bubble_color');
-    final otherColor = await _db.getSetting('other_bubble_color');
-    
-    if (myColor != null) _myBubbleColor = int.parse(myColor);
-    if (otherColor != null) _otherBubbleColor = int.parse(otherColor);
-    
-    notifyListeners();
-  }
-  
-  Future<void> _loadNotificationSettings() async {
-    final enabled = await _db.getSetting('notifications_enabled');
-    _notificationsEnabled = enabled != 'false';
+  Future<void> _loadSettings() async {
+    final my = await _db.getSetting('my_bubble_color');
+    final other = await _db.getSetting('other_bubble_color');
+    final notif = await _db.getSetting('notifications_enabled');
+    if (my != null) _myBubbleColor = int.tryParse(my) ?? _myBubbleColor;
+    if (other != null) _otherBubbleColor = int.tryParse(other) ?? _otherBubbleColor;
+    _notificationsEnabled = notif != 'false';
     notifyListeners();
   }
 
@@ -793,69 +589,23 @@ class ChatProvider with ChangeNotifier {
     notifyListeners();
   }
 
-  bool hasMoreMessages(int oderId) {
-    return _hasMoreMessages[oderId] ?? true;
+  String contactName(String fallback) {
+    final custom = _contact?['custom_name'] as String?;
+    return custom != null && custom.isNotEmpty ? custom : fallback;
   }
 
-  bool isLoadingMore(int oderId) {
-    return _isLoadingMore[oderId] ?? false;
-  }
+  int get contactAvatarColor => _contact?['custom_avatar_color'] as int? ?? Colors.blue.toARGB32();
 
-  Future<void> loadMoreMessages(int oderId) async {
-    if (_myUserId == null) return;
-    if (_isLoadingMore[oderId] == true) return;
-    if (_hasMoreMessages[oderId] == false) return;
-    
-    // Проверка связи на Windows
-    if (Platform.isWindows && !ConnectionService().isConnected) return;
-    
-    final messages = _chats[oderId];
-    if (messages == null || messages.isEmpty) return;
-    
-    _isLoadingMore[oderId] = true;
-    notifyListeners();
-    
-    try {
-      final oldestSeqId = messages
-          .where((m) => m.seqId > 0)
-          .map((m) => m.seqId)
-          .reduce((a, b) => a < b ? a : b);
-      
-      print('📜 Loading more messages before seq=$oldestSeqId');
-      
-      _ws.syncBefore(beforeSeqId: oldestSeqId, limit: 50);
-      
-      await Future.delayed(const Duration(seconds: 2));
-      
-    } catch (e) {
-      print('Error loading more messages: $e');
-    } finally {
-      _isLoadingMore[oderId] = false;
-      notifyListeners();
-    }
-  }
-
-  Future<void> clearLocalData() async {
-    print('🧹 Clearing local message data...');
-    
-    _chats.clear();
-    _typingUsers.clear();
-    _hasMoreMessages.clear();
-    _isLoadingMore.clear();
-    
-    final db = await _db.database;
-    await db.delete('messages');
-    
-    print('🧹 Local messages cleared');
+  Future<void> saveContact(String? name, int? color) async {
+    if (_peerId == null) return;
+    await _db.saveContact(_peerId!, name, color);
+    _contact = {'custom_name': name, 'custom_avatar_color': color};
     notifyListeners();
   }
 
   @override
   void dispose() {
-    _wsSubscription?.cancel();
-    if (Platform.isWindows) {
-      ConnectionService().removeListener(_onConnectionChanged);
-    }
+    _wsSub?.cancel();
     super.dispose();
   }
 }

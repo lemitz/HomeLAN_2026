@@ -1,42 +1,28 @@
 // lib/providers/auth_provider.dart
-import 'dart:io';
+import 'dart:convert';
+
 import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:uuid/uuid.dart';
-import '../services/services.dart';
-import '../services/foreground_service.dart';
 
+import '../models/models.dart';
+import '../services/services.dart';
+
+enum AuthStatus { loading, loggedOut, loggedIn }
+
+/// Аккаунт, сессия и ключи этого устройства.
+///
+/// Правила:
+/// * Сетевая ошибка никогда не разлогинивает и ничего не стирает —
+///   приложение просто работает офлайн.
+/// * Выход (logout) отзывает сессию, но сохраняет identity-ключ и device_id:
+///   повторный вход по паролю на этом устройстве вернёт доступ к истории.
+/// * Новое устройство подключается только через привязку (linking).
+/// * Полная очистка удаляет всё, включая ключ, и отзывает устройство.
 class AuthProvider with ChangeNotifier {
   final ApiService _api;
   final WebSocketService _ws;
   final DatabaseService _db;
   final CryptoService _crypto;
-
-  int? _userId;
-  String? _username;
-  String? _deviceId;
-  bool _isAdmin = false;
-  bool _isLoading = false;
-  String? _error;
-  bool _sessionInvalid = false;
-  
-  int? _partnerId;
-  String? _partnerUsername;
-
-  int? get userId => _userId;
-  String? get username => _username;
-  String? get deviceId => _deviceId;
-  bool get isAdmin => _isAdmin;
-  bool get isLoading => _isLoading;
-  bool get isLoggedIn => _userId != null && !_sessionInvalid;
-  String? get error => _error;
-  bool get sessionInvalid => _sessionInvalid;
-  CryptoService get crypto => _crypto;
-  ApiService get apiService => _api;
-  
-  int? get partnerId => _partnerId;
-  String? get partnerUsername => _partnerUsername;
-  bool get hasPartner => _partnerId != null && _partnerId! > 0;
 
   AuthProvider({
     required ApiService api,
@@ -46,295 +32,336 @@ class AuthProvider with ChangeNotifier {
   })  : _api = api,
         _ws = ws,
         _db = db,
-        _crypto = crypto;
+        _crypto = crypto {
+    _ws.onUnauthorized = _onSessionRejected;
+  }
+
+  AuthStatus _status = AuthStatus.loading;
+  UserInfo? _user;
+  UserInfo? _partner;
+  String? _deviceId;
+  bool _isBusy = false;
+  String? _error;
+  String? _notice;
+  PeerKeyStatus _partnerKeyStatus = PeerKeyStatus.unknown;
+
+  AuthStatus get status => _status;
+  bool get isLoggedIn => _status == AuthStatus.loggedIn;
+  bool get isBusy => _isBusy;
+  String? get error => _error;
+
+  /// Сообщение для экрана входа (например, «сессия истекла»).
+  String? get notice => _notice;
+
+  int? get userId => _user?.id;
+  String? get username => _user?.username;
+  bool get isAdmin => _user?.isAdmin ?? false;
+  String? get deviceId => _deviceId;
+  UserInfo? get partner => _partner;
+  int? get partnerId => _partner?.id;
+  String? get partnerUsername => _partner?.username;
+  bool get hasPartner => _partner != null;
+  PeerKeyStatus get partnerKeyStatus => _partnerKeyStatus;
+  ApiService get api => _api;
+  CryptoService get crypto => _crypto;
+
+  /// Можно ли отправлять сообщения собеседнику.
+  bool get canEncrypt => _partnerKeyStatus == PeerKeyStatus.trusted || _partnerKeyStatus == PeerKeyStatus.verified;
+
+  // ============ STARTUP ============
 
   Future<void> init() async {
-    await _crypto.init();
-    await ForegroundService().init();
-    
-    _api.token = await _crypto.getSessionToken();
-    
     final prefs = await SharedPreferences.getInstance();
-    _userId = prefs.getInt('user_id');
-    _username = prefs.getString('username');
-    _deviceId = prefs.getString('device_id');
-    _isAdmin = prefs.getBool('is_admin') ?? false;
-    _partnerId = prefs.getInt('partner_id');
-    _partnerUsername = prefs.getString('partner_username');
+    _deviceId = prefs.getString('device_id_v2');
+    final token = await _crypto.readToken();
+    final hasIdentity = await _crypto.loadIdentity();
+    final cachedUser = _decodeUser(prefs.getString('user_v2'));
 
-    if (_deviceId == null) {
-      _deviceId = const Uuid().v4();
-      await prefs.setString('device_id', _deviceId!);
+    if (token == null || !hasIdentity || cachedUser == null || _deviceId == null) {
+      _setStatus(AuthStatus.loggedOut);
+      return;
     }
 
-    if (_userId != null && _deviceId != null) {
-      final isValid = await _validateSession();
-      if (isValid) {
-        await _connectWebSocket();
-        await _refreshPartner();
-      } else {
-        print('⚠️ Session invalid, forcing logout');
-        _sessionInvalid = true;
-        await fullWipe();
+    // Входим сразу из кеша — приложение работает и без сервера.
+    _api.token = token;
+    _user = cachedUser;
+    _partner = _decodeUser(prefs.getString('partner_v2'));
+    if (_partner != null) {
+      await _crypto.loadPinnedPeer(_partner!.id);
+      _partnerKeyStatus = _crypto.peerStatus(_partner!.id);
+      if (_partnerKeyStatus == PeerKeyStatus.unknown) {
+        _partnerKeyStatus = await _crypto.registerPeerKey(_partner!.id, _partner!.publicKey);
       }
     }
-
-    notifyListeners();
+    _setStatus(AuthStatus.loggedIn);
+    _ws.start(token);
+    ForegroundService().start();
+    refreshSession();
   }
 
-  Future<bool> _validateSession() async {
-    if (_userId == null) return false;
-    
+  /// Проверяет сессию на сервере и обновляет данные собеседника.
+  /// 401 — разлогиниваем (ключ сохраняется), сетевые ошибки игнорируем.
+  Future<void> refreshSession() async {
+    if (!isLoggedIn) return;
     try {
-      final userData = await _api.getUser(_userId!);
-      if (userData['id'] == _userId) {
-        print('✅ Session valid for user $_userId');
-        return true;
-      }
-      return false;
+      final data = await _api.session();
+      await _applySession(data, saveToken: false);
+    } on ApiException catch (e) {
+      if (e.isUnauthorized) await _onSessionRejected();
+    } on NetworkException {
+      // Офлайн — работаем с кешем.
     } catch (e) {
-      print('❌ Session validation failed: $e');
-      return false;
+      debugPrint('refreshSession: $e');
     }
   }
 
-  // ИСПРАВЛЕНО: Получаем и сохраняем публичный ключ партнёра
-  Future<void> _refreshPartner() async {
-    if (_userId == null) return;
-    
-    try {
-      final partner = await _api.getPartner(_userId!);
-      if (partner != null) {
-        _partnerId = partner['id'];
-        _partnerUsername = partner['username'];
-        
-        // ВАЖНО: Сохраняем публичный ключ партнёра!
-        if (partner['public_key'] != null) {
-          final publicKeyBase64 = partner['public_key'] as String;
-          _crypto.setUserPublicKeyBase64(_partnerId!, publicKeyBase64);
-          print('🔐 Loaded partner public key for user $_partnerId');
+  Future<void> _onSessionRejected() async {
+    if (!isLoggedIn) return;
+    await _endSession(notice: 'Сессия недействительна. Войдите снова');
+  }
+
+  // ============ REGISTER / LOGIN / LINK ============
+
+  Future<bool> register(String username, String password) => _guard(() async {
+        // Новый аккаунт — новое устройство и новый identity-ключ. Старые
+        // ключи заменяются только после успешного ответа сервера.
+        final deviceId = DeviceInfo.newDeviceId();
+        final identity = await EphemeralKey.generate();
+        final data = await _api.register(
+          username: username,
+          password: password,
+          deviceId: deviceId,
+          deviceName: DeviceInfo.name(),
+          deviceType: DeviceInfo.type(),
+          publicKey: identity.publicKey,
+        );
+        await _replaceIdentity(identity.privateKey, identity.publicKey);
+        await _saveDeviceId(deviceId);
+        await _applySession(data, saveToken: true);
+      });
+
+  Future<bool> login(String username, String password) => _guard(() async {
+        if (_deviceId == null || !await _crypto.loadIdentity()) {
+          throw const _UserError('На этом устройстве нет ключа шифрования. '
+              'Привяжите устройство с уже подключённого («Привязать к аккаунту»)');
         }
-        
-        final prefs = await SharedPreferences.getInstance();
-        await prefs.setInt('partner_id', _partnerId!);
-        await prefs.setString('partner_username', _partnerUsername!);
-        
-        print('👥 Partner: $_partnerUsername (ID: $_partnerId)');
-      }
-    } catch (e) {
-      print('⚠️ Failed to get partner: $e');
-    }
-  }
+        final data = await _api.login(username: username, password: password, deviceId: _deviceId!);
+        await _applySession(data, saveToken: true);
+      });
 
-  Future<bool> register(String username, String password) async {
-    _isLoading = true;
-    _error = null;
-    _sessionInvalid = false;
-    notifyListeners();
-
-    try {
-      final deviceName = Platform.localHostname;
-      final deviceType = Platform.operatingSystem;
-      final publicKey = await _crypto.getPublicKey();
-
-      final result = await _api.register(
-        username: username,
-        password: password,
-        deviceId: _deviceId!,
-        deviceName: deviceName,
-        deviceType: deviceType,
-        publicKey: publicKey,
-      );
-
-      _userId = result['user_id'];
-      _username = username;
-      _isAdmin = result['is_admin'] ?? false;
-
-      final token = result['token'] as String?;
-      if (token != null) {
-        await _crypto.saveSessionToken(token);
-        _api.token = token;
-      }
-
-      await _saveSession();
-      await _connectWebSocket();
-      await _refreshPartner();
-
-      _isLoading = false;
-      notifyListeners();
-      return true;
-    } catch (e) {
-      _error = e.toString();
-      _isLoading = false;
-      notifyListeners();
-      return false;
-    }
-  }
-
-  Future<bool> login(String username, String password) async {
-    _isLoading = true;
-    _error = null;
-    _sessionInvalid = false;
-    notifyListeners();
-
-    try {
-      final publicKey = await _crypto.getPublicKey();
-      
-      final result = await _api.login(
-        username: username,
-        password: password,
-        deviceId: _deviceId!,
-        publicKey: publicKey,
-      );
-
-      _userId = result['user_id'];
-      _username = username;
-      _isAdmin = result['is_admin'] ?? false;
-      
-      final token = result['token'] as String?;
-      if (token != null) {
-        await _crypto.saveSessionToken(token);
-        _api.token = token;
-      }
-
-      // Партнёр приходит сразу с логина
-      if (result['partner_id'] != null && result['partner_id'] > 0) {
-        _partnerId = result['partner_id'];
-        _partnerUsername = result['partner_username'];
-        
-        // ВАЖНО: Сохраняем публичный ключ партнёра если есть
-        if (result['partner_public_key'] != null) {
-          _crypto.setUserPublicKeyBase64(_partnerId!, result['partner_public_key']);
-          print('🔐 Loaded partner public key from login');
-        }
-      }
-
-      await _saveSession();
-      await _connectWebSocket();
-      
-      // Если ключ не пришёл с логина — получаем отдельно
-      if (_partnerId != null && !_crypto.hasUserPublicKey(_partnerId!)) {
-        await _refreshPartner();
-      }
-
-      _isLoading = false;
-      notifyListeners();
-      return true;
-    } catch (e) {
-      _error = e.toString();
-      _isLoading = false;
-      notifyListeners();
-      return false;
-    }
-  }
-
-  Future<void> completeDeviceLinking({
-    required int userId,
-    required String username,
+  /// Завершение привязки: [identityPrivate] получен из QR#2.
+  Future<bool> completeLinking({
     required String deviceId,
-    String? token,
-  }) async {
-    _userId = userId;
-    _username = username;
-    _deviceId = deviceId;
-    _sessionInvalid = false;
-    
-    if (token != null) {
-      await _crypto.saveSessionToken(token);
+    required String linkCode,
+    required Uint8List identityPrivate,
+  }) =>
+      _guard(() async {
+        final data = await _api.completeLinking(linkCode: linkCode, deviceId: deviceId);
+        final user = UserInfo.fromJson(data['user']);
+        if (user == null) throw const _UserError('Некорректный ответ сервера');
+        final pub = await CryptoService.publicFromPrivate(identityPrivate);
+        if (!CryptoService.equalBytes(pub, user.publicKey)) {
+          // Ключ не совпал с ключом аккаунта — сессию на сервере сразу закрываем.
+          _api.token = data['token'] as String?;
+          try {
+            await _api.revokeDevice(deviceId);
+          } catch (_) {}
+          _api.token = null;
+          throw const _UserError('Полученный ключ не совпадает с ключом аккаунта. Привязка отменена');
+        }
+        await _replaceIdentity(identityPrivate, pub);
+        await _saveDeviceId(deviceId);
+        await _applySession(data, saveToken: true);
+      });
+
+  /// Заменяет все секреты устройства новым identity-ключом.
+  Future<void> _replaceIdentity(Uint8List priv, Uint8List pub) async {
+    await _crypto.wipeAll();
+    await _db.clearAll();
+    await _crypto.importIdentity(priv, expectedPublic: pub);
+  }
+
+  Future<void> _applySession(Map<String, dynamic> data, {required bool saveToken}) async {
+    final user = UserInfo.fromJson(data['user']);
+    if (user == null) throw const _UserError('Некорректный ответ сервера');
+
+    // Ключ аккаунта на сервере обязан совпадать с ключом устройства.
+    final myPub = await _crypto.identityPublicKey();
+    if (!CryptoService.equalBytes(myPub, user.publicKey)) {
+      throw const _UserError('Ключ шифрования устройства не совпадает с ключом аккаунта на сервере. '
+          'Возможна подмена сервера. Вход остановлен');
+    }
+
+    if (saveToken) {
+      final token = data['token'] as String?;
+      if (token == null) throw const _UserError('Сервер не выдал токен');
+      await _crypto.saveToken(token);
       _api.token = token;
     }
+    _user = user;
+    _notice = null;
+
+    final partner = UserInfo.fromJson(data['partner']);
+    if (partner != null) {
+      _partner = partner;
+      _partnerKeyStatus = await _crypto.registerPeerKey(partner.id, partner.publicKey);
+    }
 
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setString('device_id', deviceId);
-    
-    await _saveSession();
-    await _connectWebSocket();
-    await _refreshPartner();
-    
-    print('🔐 Device linked successfully: $username (ID: $userId)');
+    await prefs.setString('user_v2', jsonEncode(user.toJson()));
+    if (_partner != null) await prefs.setString('partner_v2', jsonEncode(_partner!.toJson()));
+
+    if (_status != AuthStatus.loggedIn) {
+      _setStatus(AuthStatus.loggedIn);
+      _ws.start(_api.token!);
+      ForegroundService().start();
+    } else {
+      notifyListeners();
+    }
+  }
+
+  /// Проверяет, не появился ли собеседник (экран ожидания).
+  Future<void> refreshPartner() async {
+    if (!isLoggedIn) return;
+    try {
+      final p = UserInfo.fromJson(await _api.partner());
+      if (p == null) return;
+      _partner = p;
+      _partnerKeyStatus = await _crypto.registerPeerKey(p.id, p.publicKey);
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString('partner_v2', jsonEncode(p.toJson()));
+      notifyListeners();
+    } on ApiException catch (e) {
+      if (e.isUnauthorized) await _onSessionRejected();
+    } on NetworkException {
+      // офлайн
+    }
+  }
+
+  // ============ PARTNER KEY ============
+
+  Future<String?> safetyNumber() async {
+    final p = _partner;
+    if (p == null) return null;
+    final peerKey = _crypto.pendingPeerKey(p.id) ?? _crypto.peerKey(p.id);
+    if (peerKey == null) return null;
+    return CryptoService.safetyNumber(await _crypto.identityPublicKey(), peerKey);
+  }
+
+  Future<void> markPartnerVerified() async {
+    final p = _partner;
+    if (p == null) return;
+    if (_partnerKeyStatus == PeerKeyStatus.mismatch) {
+      await _crypto.acceptPendingPeerKey(p.id);
+    }
+    await _crypto.setVerified(p.id, true);
+    _partnerKeyStatus = _crypto.peerStatus(p.id);
     notifyListeners();
   }
 
+  // ============ LOGOUT / WIPE ============
+
+  /// Выход: сессия отзывается, кеш сообщений очищается,
+  /// identity-ключ и device_id остаются на устройстве.
   Future<void> logout() async {
-    await ForegroundService().stop();
-    _ws.disconnect();
-
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.remove('user_id');
-    await prefs.remove('username');
-    await prefs.remove('is_admin');
-    await prefs.remove('partner_id');
-    await prefs.remove('partner_username');
-
-    await _crypto.clearKeys();
-    _api.token = null;
-
-    _userId = null;
-    _username = null;
-    _isAdmin = false;
-    _partnerId = null;
-    _partnerUsername = null;
-    _sessionInvalid = false;
-
-    notifyListeners();
+    try {
+      await _api.logout();
+    } catch (_) {}
+    await _endSession();
   }
 
+  Future<void> _endSession({String? notice}) async {
+    _ws.stop();
+    await ForegroundService().stop();
+    await _crypto.clearToken();
+    _api.token = null;
+    await _db.clearMessages();
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove('user_v2');
+    await prefs.remove('partner_v2');
+    _user = null;
+    _partner = null;
+    _partnerKeyStatus = PeerKeyStatus.unknown;
+    _notice = notice;
+    _setStatus(AuthStatus.loggedOut);
+  }
+
+  /// Полная очистка: отзыв устройства на сервере (если доступен) и удаление
+  /// всех ключей, токенов и кеша. Устройство придётся привязывать заново.
   Future<void> fullWipe() async {
-    print('🗑️ Starting full wipe...');
-    
+    if (_deviceId != null && _api.token != null) {
+      try {
+        await _api.revokeDevice(_deviceId!);
+      } catch (_) {}
+    }
+    _ws.stop();
     await ForegroundService().stop();
-    _ws.disconnect();
-
-    final prefs = await SharedPreferences.getInstance();
-    final deviceId = prefs.getString('device_id');
-    await prefs.clear();
-    if (deviceId != null) {
-      await prefs.setString('device_id', deviceId);
-    }
-
-    await _crypto.clearKeys();
+    await _crypto.wipeAll();
     await _db.clearAll();
-    _api.token = null;
-
-    _userId = null;
-    _username = null;
-    _isAdmin = false;
-    _partnerId = null;
-    _partnerUsername = null;
-    _sessionInvalid = false;
-    _error = null;
-
-    print('✅ Full wipe complete');
-    notifyListeners();
-  }
-
-  Future<void> _saveSession() async {
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setInt('user_id', _userId!);
-    await prefs.setString('username', _username!);
-    await prefs.setBool('is_admin', _isAdmin);
-    if (_partnerId != null) {
-      await prefs.setInt('partner_id', _partnerId!);
+    await prefs.clear();
+    _api.token = null;
+    _deviceId = null;
+    _user = null;
+    _partner = null;
+    _partnerKeyStatus = PeerKeyStatus.unknown;
+    _notice = null;
+    _setStatus(AuthStatus.loggedOut);
+  }
+
+  // ============ HELPERS ============
+
+  Future<bool> _guard(Future<void> Function() action) async {
+    _isBusy = true;
+    _error = null;
+    notifyListeners();
+    try {
+      await action();
+      return true;
+    } on ApiException catch (e) {
+      _error = e.userMessage;
+    } on NetworkException {
+      _error = 'Сервер недоступен. Проверьте подключение к домашней сети';
+    } on _UserError catch (e) {
+      _error = e.message;
+    } on CryptoException catch (e) {
+      _error = e.message;
+    } catch (e) {
+      _error = 'Ошибка: $e';
+    } finally {
+      _isBusy = false;
+      notifyListeners();
     }
-    if (_partnerUsername != null) {
-      await prefs.setString('partner_username', _partnerUsername!);
+    return false;
+  }
+
+  Future<void> _saveDeviceId(String id) async {
+    _deviceId = id;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('device_id_v2', id);
+  }
+
+  UserInfo? _decodeUser(String? json) {
+    if (json == null) return null;
+    try {
+      return UserInfo.fromJson(jsonDecode(json));
+    } catch (_) {
+      return null;
     }
   }
 
-  Future<void> _connectWebSocket() async {
-    if (_userId != null && _deviceId != null) {
-      final token = await _crypto.getSessionToken() ?? 'temp_token';
-      await _ws.connect(
-        userId: _userId!,
-        deviceId: _deviceId!,
-        token: token,
-      );
-      await ForegroundService().start();
-    }
+  void _setStatus(AuthStatus s) {
+    _status = s;
+    notifyListeners();
   }
 
   void clearError() {
     _error = null;
     notifyListeners();
   }
+}
+
+class _UserError implements Exception {
+  final String message;
+  const _UserError(this.message);
 }

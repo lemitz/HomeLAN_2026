@@ -39,8 +39,8 @@ class _RegisterScreenState extends State<RegisterScreen> {
       return;
     }
 
-    if (password.length < 4) {
-      _showError('Пароль минимум 4 символа');
+    if (password.length < 8) {
+      _showError('Пароль минимум 8 символов');
       return;
     }
 
@@ -191,14 +191,14 @@ class _RegisterScreenState extends State<RegisterScreen> {
                   width: double.infinity,
                   height: 50,
                   child: ElevatedButton(
-                    onPressed: auth.isLoading ? null : _register,
+                    onPressed: auth.isBusy ? null : _register,
                     style: ElevatedButton.styleFrom(
                       backgroundColor: Colors.blue[600],
                       shape: RoundedRectangleBorder(
                         borderRadius: BorderRadius.circular(12),
                       ),
                     ),
-                    child: auth.isLoading
+                    child: auth.isBusy
                         ? const SizedBox(
                             width: 24,
                             height: 24,

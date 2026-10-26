@@ -1,7 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import '../providers/providers.dart';
-import '../services/services.dart';
+import '../widgets/server_address.dart';
 import 'register_screen.dart';
 import 'new_device_link_screen.dart';
 
@@ -95,7 +95,18 @@ class _LoginScreenState extends State<LoginScreen> {
                     color: Colors.grey[400],
                   ),
                 ),
-                const SizedBox(height: 48),
+                const SizedBox(height: 32),
+                if (auth.notice != null)
+                  Container(
+                    width: double.infinity,
+                    margin: const EdgeInsets.only(bottom: 16),
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      color: Colors.orange.withValues(alpha: 0.15),
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    child: Text(auth.notice!, style: TextStyle(color: Colors.orange[300])),
+                  ),
                 TextField(
                   controller: _usernameController,
                   style: const TextStyle(color: Colors.white),
@@ -153,14 +164,14 @@ class _LoginScreenState extends State<LoginScreen> {
                   width: double.infinity,
                   height: 50,
                   child: ElevatedButton(
-                    onPressed: auth.isLoading ? null : _login,
+                    onPressed: auth.isBusy ? null : _login,
                     style: ElevatedButton.styleFrom(
                       backgroundColor: Colors.blue[600],
                       shape: RoundedRectangleBorder(
                         borderRadius: BorderRadius.circular(12),
                       ),
                     ),
-                    child: auth.isLoading
+                    child: auth.isBusy
                         ? const SizedBox(
                             width: 24,
                             height: 24,
@@ -192,9 +203,9 @@ class _LoginScreenState extends State<LoginScreen> {
                     style: TextStyle(color: Colors.blue[400]),
                   ),
                 ),
-                
+
                 const SizedBox(height: 32),
-                
+
                 // Разделитель
                 Row(
                   children: [
@@ -206,9 +217,9 @@ class _LoginScreenState extends State<LoginScreen> {
                     Expanded(child: Divider(color: Colors.grey[700])),
                   ],
                 ),
-                
+
                 const SizedBox(height: 24),
-                
+
                 // Кнопка привязки к аккаунту
                 SizedBox(
                   width: double.infinity,
@@ -234,6 +245,8 @@ class _LoginScreenState extends State<LoginScreen> {
                   'Есть аккаунт на другом устройстве?',
                   style: TextStyle(color: Colors.grey[500], fontSize: 12),
                 ),
+                const SizedBox(height: 32),
+                const ServerAddressField(),
               ],
             ),
           ),

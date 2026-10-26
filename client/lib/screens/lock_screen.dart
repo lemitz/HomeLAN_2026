@@ -1,32 +1,32 @@
 // lib/screens/lock_screen.dart
 import 'package:flutter/material.dart';
+
 import '../services/biometric_service.dart';
 
-class LockScreen extends StatefulWidget {
+/// Блокировка приложения (Android): биометрия или PIN устройства при запуске
+/// и при каждом возвращении из фона.
+///
+/// Экран блокировки рисуется ПОВЕРХ приложения, поэтому все открытые
+/// экраны и их состояние сохраняются, но ничего не видно и не нажимается.
+class LockGate extends StatefulWidget {
   final Widget child;
-  
-  const LockScreen({super.key, required this.child});
+  const LockGate({super.key, required this.child});
 
   @override
-  State<LockScreen> createState() => _LockScreenState();
+  State<LockGate> createState() => _LockGateState();
 }
 
-class _LockScreenState extends State<LockScreen> with WidgetsBindingObserver {
-  bool _isLocked = true;
-  bool _isAuthenticating = false;
-  bool _didInitialAuth = false;
+class _LockGateState extends State<LockGate> with WidgetsBindingObserver {
+  bool _locked = true;
+  bool _authenticating = false;
+  bool _obscured = false; // приложение в переключателе задач
+  String? _message;
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    // Делаем первичную аутентификацию после первого кадра
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!_didInitialAuth) {
-        _didInitialAuth = true;
-        _authenticate();
-      }
-    });
+    WidgetsBinding.instance.addPostFrameCallback((_) => _unlock());
   }
 
   @override
@@ -37,124 +37,94 @@ class _LockScreenState extends State<LockScreen> with WidgetsBindingObserver {
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    debugPrint('🔒 Lifecycle: $state, isLocked: $_isLocked');
-    
-    if (state == AppLifecycleState.paused || state == AppLifecycleState.hidden) {
-      // Приложение свернули — блокируем
-      if (!_isLocked) {
-        setState(() {
-          _isLocked = true;
-        });
-        BiometricService().lock();
-      }
-    } else if (state == AppLifecycleState.resumed) {
-      // Приложение развернули — если заблокировано, запрашиваем биометрию
-      if (_isLocked && !_isAuthenticating) {
-        _authenticate();
-      }
+    final suspended = BiometricService().isSuspended || _authenticating;
+    switch (state) {
+      case AppLifecycleState.inactive:
+        if (!suspended) setState(() => _obscured = true);
+        break;
+      case AppLifecycleState.hidden:
+      case AppLifecycleState.paused:
+        if (!suspended && !_locked) setState(() => _locked = true);
+        break;
+      case AppLifecycleState.resumed:
+        setState(() => _obscured = false);
+        if (_locked && !_authenticating) _unlock();
+        break;
+      case AppLifecycleState.detached:
+        break;
     }
   }
 
-  Future<void> _authenticate() async {
-    if (_isAuthenticating) return;
-    
+  Future<void> _unlock() async {
+    if (_authenticating) return;
     setState(() {
-      _isAuthenticating = true;
+      _authenticating = true;
+      _message = null;
     });
-
-    try {
-      final success = await BiometricService().authenticate();
-      debugPrint('🔒 Auth result: $success');
-      
-      if (mounted) {
-        setState(() {
-          _isLocked = !success;
-          _isAuthenticating = false;
-        });
+    final result = await BiometricService().authenticate();
+    if (!mounted) return;
+    setState(() {
+      _authenticating = false;
+      switch (result) {
+        case UnlockResult.success:
+          _locked = false;
+          break;
+        case UnlockResult.notAvailable:
+          // На устройстве не настроена никакая блокировка — защищать нечем.
+          _locked = false;
+          break;
+        case UnlockResult.failed:
+          _message = 'Не удалось подтвердить личность';
+          break;
       }
-    } catch (e) {
-      debugPrint('🔒 Auth error: $e');
-      if (mounted) {
-        setState(() {
-          // При ошибке — разблокируем чтобы не застрять
-          _isLocked = false;
-          _isAuthenticating = false;
-        });
-      }
-    }
+    });
   }
 
   @override
   Widget build(BuildContext context) {
-    // Если разблокировано — показываем child
-    if (!_isLocked) {
-      return widget.child;
-    }
-    
-    // Экран блокировки
-    return Scaffold(
-      backgroundColor: Colors.black,
-      body: Container(
+    return Stack(
+      textDirection: TextDirection.ltr,
+      children: [
+        widget.child,
+        if (_locked || _obscured) Positioned.fill(child: _buildOverlay(context)),
+      ],
+    );
+  }
+
+  Widget _buildOverlay(BuildContext context) {
+    return Material(
+      color: Colors.black,
+      child: Container(
         decoration: BoxDecoration(
           gradient: LinearGradient(
             begin: Alignment.topCenter,
             end: Alignment.bottomCenter,
-            colors: [
-              Colors.grey[900]!,
-              Colors.black,
-            ],
+            colors: [Colors.grey[900]!, Colors.black],
           ),
         ),
         child: Center(
           child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
+            mainAxisSize: MainAxisSize.min,
             children: [
-              Icon(
-                Icons.lock_outline,
-                size: 80,
-                color: Colors.blue[400],
-              ),
+              Icon(Icons.lock_outline, size: 80, color: Colors.blue[400]),
               const SizedBox(height: 24),
-              const Text(
-                'HomeLAN',
-                style: TextStyle(
-                  fontSize: 32,
-                  fontWeight: FontWeight.bold,
-                  color: Colors.white,
-                ),
-              ),
-              const SizedBox(height: 8),
-              Text(
-                '🔐 Защищено',
-                style: TextStyle(
-                  fontSize: 16,
-                  color: Colors.green[400],
-                ),
-              ),
+              const Text('HomeLAN', style: TextStyle(fontSize: 32, fontWeight: FontWeight.bold, color: Colors.white)),
               const SizedBox(height: 48),
-              if (_isAuthenticating)
-                Column(
-                  children: [
-                    const CircularProgressIndicator(),
-                    const SizedBox(height: 16),
-                    Text(
-                      'Проверка...',
-                      style: TextStyle(color: Colors.grey[400]),
-                    ),
-                  ],
-                )
-              else
+              if (_locked && _authenticating)
+                const CircularProgressIndicator()
+              else if (_locked) ...[
+                if (_message != null)
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 16),
+                    child: Text(_message!, style: TextStyle(color: Colors.red[300])),
+                  ),
                 ElevatedButton.icon(
-                  onPressed: _authenticate,
+                  onPressed: _unlock,
                   icon: const Icon(Icons.fingerprint),
                   label: const Text('Разблокировать'),
-                  style: ElevatedButton.styleFrom(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 32,
-                      vertical: 16,
-                    ),
-                  ),
+                  style: ElevatedButton.styleFrom(padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 16)),
                 ),
+              ],
             ],
           ),
         ),
