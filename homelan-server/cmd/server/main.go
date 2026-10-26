@@ -20,7 +20,7 @@ import (
 )
 
 // Version — версия сервера (переопределяется при сборке через -ldflags).
-var Version = "1.0.0-dev"
+var Version = "1.0.0"
 
 func main() {
 	initUSB := flag.Bool("init-usb", false, "создать USB master key на съёмном накопителе")
