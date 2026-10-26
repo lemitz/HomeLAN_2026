@@ -1,306 +1,440 @@
+// lib/services/crypto_service.dart
+//
+// Криптографический протокол HomeLAN v2.
+//
+// * У каждого ПОЛЬЗОВАТЕЛЯ один identity-ключ X25519. Он создаётся при
+//   регистрации, хранится в защищённом хранилище ОС и переносится на новые
+//   устройства только через 2-QR linking (зашифрованно, см. LinkCrypto).
+// * Ключ сообщений: HKDF-SHA256(X25519(мой, его), salt, info=пара id).
+// * Шифр: XChaCha20-Poly1305, 24-байтовый случайный nonce.
+// * AAD = отправитель | получатель | тип | client_id — защищает от
+//   отражения сообщения обратно, подмены типа и повторов сервером.
+// * Формат: [0x02][nonce 24][ciphertext][mac 16].
+// * Ключ собеседника закрепляется при первом получении (TOFU); смена ключа
+//   блокирует отправку до явного подтверждения пользователем.
 import 'dart:convert';
 import 'dart:typed_data';
-import 'package:flutter/foundation.dart';
+import '../l10n/strings.dart';
+
 import 'package:cryptography/cryptography.dart';
-import 'package:shared_preferences/shared_preferences.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
+const int kCryptoVersion = 0x02;
+
+class CryptoException implements Exception {
+  final String message;
+  CryptoException(this.message);
+  @override
+  String toString() => message;
+}
+
+/// Состояние ключа собеседника.
+enum PeerKeyStatus {
+  /// Ключ ещё не получен.
+  unknown,
+
+  /// Ключ закреплён (TOFU), но пользователь не сверял отпечаток.
+  trusted,
+
+  /// Отпечаток сверен вручную.
+  verified,
+
+  /// Сервер прислал ДРУГОЙ ключ. Отправка заблокирована.
+  mismatch,
+}
+
 class CryptoService {
-  static const String _privateKeyKey = 'private_key';
-  static const String _publicKeyKey = 'public_key';
-  static const String _sessionTokenKey = 'session_token';
-  
-  final _secureStorage = const FlutterSecureStorage(
-    aOptions: AndroidOptions(encryptedSharedPreferences: true),
-  );
-  
-  final X25519 _keyExchange = X25519();
-  final Chacha20 _cipher = Chacha20.poly1305Aead();
-  
-  SimpleKeyPair? _keyPair;
-  final Map<int, SimplePublicKey> _publicKeys = {};
+  static const _idPriv = 'identity_private_v2';
+  static const _idPub = 'identity_public_v2';
+  static const _token = 'session_token_v2';
+  static const _peerPrefix = 'peer_key_v2_';
+  static const _verifiedPrefix = 'peer_verified_v2_';
 
-  /// Инициализация — загружаем или генерируем ключи
-  Future<void> init() async {
-    // 1. Try reading from SecureStorage
-    String? privateKeyBase64 = await _secureStorage.read(key: _privateKeyKey);
-    String? publicKeyBase64 = await _secureStorage.read(key: _publicKeyKey);
+  static final _x25519 = X25519();
+  static final _aead = Xchacha20.poly1305Aead();
+  static final _hkdf = Hkdf(hmac: Hmac.sha256(), outputLength: 32);
 
-    // 2. Migration from SharedPreferences if not in SecureStorage
-    if (privateKeyBase64 == null) {
-      final prefs = await SharedPreferences.getInstance();
-      privateKeyBase64 = prefs.getString(_privateKeyKey);
-      publicKeyBase64 = prefs.getString(_publicKeyKey);
+  final FlutterSecureStorage _storage;
 
-      if (privateKeyBase64 != null && publicKeyBase64 != null) {
-        // Save to SecureStorage
-        await _secureStorage.write(key: _privateKeyKey, value: privateKeyBase64);
-        await _secureStorage.write(key: _publicKeyKey, value: publicKeyBase64);
-        
-        // Remove from SharedPreferences
-        await prefs.remove(_privateKeyKey);
-        await prefs.remove(_publicKeyKey);
-        print('🔐 Migrated key pair to secure storage and deleted from SharedPreferences');
-      }
+  CryptoService({FlutterSecureStorage? storage})
+      : _storage = storage ??
+            const FlutterSecureStorage(
+              aOptions: AndroidOptions(encryptedSharedPreferences: true),
+            );
+
+  SimpleKeyPair? _identity;
+  Uint8List? _identityPub;
+
+  final Map<int, Uint8List> _peerKeys = {}; // закреплённые ключи
+  final Map<int, Uint8List> _pendingPeerKeys = {}; // новые ключи при mismatch
+  final Map<int, bool> _verified = {};
+  final Map<String, SecretKey> _sharedKeys = {};
+
+  // ============ IDENTITY ============
+
+  Future<bool> hasIdentity() async {
+    if (_identity != null) return true;
+    return await _storage.read(key: _idPriv) != null;
+  }
+
+  /// Загружает identity-ключ из хранилища. Возвращает false, если его нет.
+  Future<bool> loadIdentity() async {
+    if (_identity != null) return true;
+    final priv = await _storage.read(key: _idPriv);
+    if (priv == null) return false;
+    await _setIdentity(base64Decode(priv));
+    return true;
+  }
+
+  /// Создаёт новый identity-ключ (при регистрации нового аккаунта).
+  Future<Uint8List> generateIdentity() async {
+    final seed = Uint8List.fromList(SecretKeyData.random(length: 32).bytes);
+    await _setIdentity(seed);
+    await _persistIdentity(seed);
+    return _identityPub!;
+  }
+
+  /// Импортирует identity-ключ (при привязке устройства). Если передан
+  /// [expectedPublic], ключ проверяется на соответствие серверному.
+  Future<void> importIdentity(Uint8List privateKey, {Uint8List? expectedPublic}) async {
+    if (privateKey.length != 32) throw CryptoException(S.current.badKeyLength);
+    final pub = await publicFromPrivate(privateKey);
+    if (expectedPublic != null && !_equal(pub, expectedPublic)) {
+      throw CryptoException(S.current.linkKeyMismatch);
     }
+    await _setIdentity(privateKey);
+    await _persistIdentity(privateKey);
+  }
 
-    if (privateKeyBase64 != null && publicKeyBase64 != null) {
-      final privateKeyBytes = base64Decode(privateKeyBase64);
-      final publicKeyBytes = base64Decode(publicKeyBase64);
-      
-      _keyPair = SimpleKeyPairData(
-        privateKeyBytes,
-        publicKey: SimplePublicKey(publicKeyBytes, type: KeyPairType.x25519),
-        type: KeyPairType.x25519,
-      );
-      print('🔐 Loaded existing key pair from secure storage');
+  Future<Uint8List> identityPublicKey() async {
+    if (_identityPub == null && !await loadIdentity()) {
+      throw CryptoException(S.current.noLocalKey);
+    }
+    return _identityPub!;
+  }
+
+  /// Приватный ключ — только для передачи на новое устройство через LinkCrypto.
+  Future<Uint8List> exportIdentityPrivate() async {
+    if (!await loadIdentity()) throw CryptoException(S.current.noLocalKey);
+    return Uint8List.fromList(await _identity!.extractPrivateKeyBytes());
+  }
+
+  Future<void> deleteIdentity() async {
+    await _storage.delete(key: _idPriv);
+    await _storage.delete(key: _idPub);
+    _identity = null;
+    _identityPub = null;
+    _sharedKeys.clear();
+  }
+
+  static Future<Uint8List> publicFromPrivate(Uint8List priv) async {
+    final kp = await _x25519.newKeyPairFromSeed(priv);
+    return Uint8List.fromList((await kp.extractPublicKey()).bytes);
+  }
+
+  Future<void> _setIdentity(Uint8List priv) async {
+    _identity = await _x25519.newKeyPairFromSeed(priv);
+    _identityPub = Uint8List.fromList((await _identity!.extractPublicKey()).bytes);
+    _sharedKeys.clear();
+  }
+
+  Future<void> _persistIdentity(Uint8List priv) async {
+    await _storage.write(key: _idPriv, value: base64Encode(priv));
+    await _storage.write(key: _idPub, value: base64Encode(_identityPub!));
+  }
+
+  // ============ SESSION TOKEN ============
+
+  Future<void> saveToken(String token) => _storage.write(key: _token, value: token);
+  Future<String?> readToken() => _storage.read(key: _token);
+  Future<void> clearToken() => _storage.delete(key: _token);
+
+  // ============ PEER KEYS (TOFU) ============
+
+  /// Регистрирует ключ собеседника, пришедший с сервера.
+  Future<PeerKeyStatus> registerPeerKey(int userId, Uint8List key) async {
+    if (key.length != 32) return PeerKeyStatus.unknown;
+    final pinned = await _loadPinned(userId);
+    if (pinned == null) {
+      await _storage.write(key: '$_peerPrefix$userId', value: base64Encode(key));
+      _peerKeys[userId] = key;
+      _pendingPeerKeys.remove(userId);
+      return PeerKeyStatus.trusted;
+    }
+    if (_equal(pinned, key)) {
+      _pendingPeerKeys.remove(userId);
+      return peerStatus(userId);
+    }
+    _pendingPeerKeys[userId] = key;
+    return PeerKeyStatus.mismatch;
+  }
+
+  /// Загружает закреплённые ключи (без обращения к серверу).
+  Future<void> loadPinnedPeer(int userId) async {
+    await _loadPinned(userId);
+  }
+
+  Future<Uint8List?> _loadPinned(int userId) async {
+    if (_peerKeys.containsKey(userId)) return _peerKeys[userId];
+    final v = await _storage.read(key: '$_peerPrefix$userId');
+    if (v == null) return null;
+    _peerKeys[userId] = base64Decode(v);
+    _verified[userId] = await _storage.read(key: '$_verifiedPrefix$userId') == '1';
+    return _peerKeys[userId];
+  }
+
+  PeerKeyStatus peerStatus(int userId) {
+    if (_pendingPeerKeys.containsKey(userId)) return PeerKeyStatus.mismatch;
+    if (!_peerKeys.containsKey(userId)) return PeerKeyStatus.unknown;
+    return _verified[userId] == true ? PeerKeyStatus.verified : PeerKeyStatus.trusted;
+  }
+
+  Uint8List? peerKey(int userId) => _peerKeys[userId];
+
+  /// Новый (непринятый) ключ собеседника при mismatch.
+  Uint8List? pendingPeerKey(int userId) => _pendingPeerKeys[userId];
+
+  /// Пользователь сверил отпечаток нового ключа и принял его.
+  Future<void> acceptPendingPeerKey(int userId) async {
+    final key = _pendingPeerKeys.remove(userId);
+    if (key == null) return;
+    await _storage.write(key: '$_peerPrefix$userId', value: base64Encode(key));
+    await setVerified(userId, false);
+    _peerKeys[userId] = key;
+    _sharedKeys.clear();
+  }
+
+  Future<void> setVerified(int userId, bool verified) async {
+    _verified[userId] = verified;
+    if (verified) {
+      await _storage.write(key: '$_verifiedPrefix$userId', value: '1');
     } else {
-      await generateKeyPair();
+      await _storage.delete(key: '$_verifiedPrefix$userId');
     }
   }
 
-  /// Генерация новой пары ключей
-  Future<void> generateKeyPair() async {
-    final keyData = await compute(_generateKeyPairIsolate, null);
-    
-    _keyPair = SimpleKeyPairData(
-      keyData['private']!,
-      publicKey: SimplePublicKey(keyData['public']!, type: KeyPairType.x25519),
-      type: KeyPairType.x25519,
+  Future<void> forgetPeer(int userId) async {
+    await _storage.delete(key: '$_peerPrefix$userId');
+    await _storage.delete(key: '$_verifiedPrefix$userId');
+    _peerKeys.remove(userId);
+    _pendingPeerKeys.remove(userId);
+    _verified.remove(userId);
+    _sharedKeys.clear();
+  }
+
+  /// Safety number: 60 цифр (12 групп по 5), одинаковые у обоих собеседников.
+  static Future<String> safetyNumber(Uint8List keyA, Uint8List keyB) async {
+    final sorted = [keyA, keyB]..sort((a, b) => _compare(a, b));
+    final input = BytesBuilder()
+      ..add(utf8.encode('homelan-safety-v2'))
+      ..add(sorted[0])
+      ..add(sorted[1]);
+    var digest = (await Sha256().hash(input.toBytes())).bytes;
+    // Растягиваем до 30 байт (по 2,5 байта на группу из 5 цифр).
+    digest = [...digest, ...(await Sha256().hash(digest)).bytes];
+    final groups = <String>[];
+    for (var i = 0; i < 12; i++) {
+      final chunk = (digest[i * 2] << 16) | (digest[i * 2 + 1] << 8) | digest[i * 2 + 24];
+      groups.add((chunk % 100000).toString().padLeft(5, '0'));
+    }
+    return groups.join(' ');
+  }
+
+  // ============ MESSAGES ============
+
+  Future<SecretKey> _sharedKey(int myId, int peerId) async {
+    if (!await loadIdentity()) throw CryptoException(S.current.noLocalKey);
+    final status = peerStatus(peerId);
+    final peer = _peerKeys[peerId];
+    if (peer == null || status == PeerKeyStatus.mismatch) {
+      throw CryptoException(status == PeerKeyStatus.mismatch ? S.current.peerKeyChanged : S.current.noPeerKey);
+    }
+    final cacheKey = '$myId:$peerId:${base64Encode(peer)}';
+    final cached = _sharedKeys[cacheKey];
+    if (cached != null) return cached;
+
+    final shared = await _x25519.sharedSecretKey(
+      keyPair: _identity!,
+      remotePublicKey: SimplePublicKey(peer, type: KeyPairType.x25519),
     );
-    
-    final privateKeyBase64 = base64Encode(keyData['private']!);
-    final publicKeyBase64 = base64Encode(keyData['public']!);
-
-    await _secureStorage.write(key: _privateKeyKey, value: privateKeyBase64);
-    await _secureStorage.write(key: _publicKeyKey, value: publicKeyBase64);
-    
-    // Ensure we delete any legacy keys in shared preferences
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.remove(_privateKeyKey);
-    await prefs.remove(_publicKeyKey);
-
-    print('🔐 Generated and saved new key pair in secure storage');
+    final lo = myId < peerId ? myId : peerId;
+    final hi = myId < peerId ? peerId : myId;
+    final key = await _hkdf.deriveKey(
+      secretKey: shared,
+      nonce: utf8.encode('homelan-v2-salt'),
+      info: utf8.encode('homelan/v2/msg/$lo/$hi'),
+    );
+    _sharedKeys[cacheKey] = key;
+    return key;
   }
 
-  static Future<Map<String, Uint8List>> _generateKeyPairIsolate(void _) async {
-    final keyExchange = X25519();
-    final keyPair = await keyExchange.newKeyPair();
-    
-    final privateKeyBytes = await keyPair.extractPrivateKeyBytes();
-    final publicKey = await keyPair.extractPublicKey();
-    
-    return {
-      'private': Uint8List.fromList(privateKeyBytes),
-      'public': Uint8List.fromList(publicKey.bytes),
-    };
+  static List<int> _aad(int senderId, int recipientId, String contentType, String clientId) =>
+      utf8.encode('homelan/v2|$senderId|$recipientId|$contentType|$clientId');
+
+  /// Шифрует сообщение от меня ([myId]) собеседнику ([peerId]).
+  Future<Uint8List> encryptMessage({
+    required Uint8List plaintext,
+    required int myId,
+    required int peerId,
+    required String contentType,
+    required String clientId,
+  }) async {
+    final key = await _sharedKey(myId, peerId);
+    final nonce = _aead.newNonce();
+    final box =
+        await _aead.encrypt(plaintext, secretKey: key, nonce: nonce, aad: _aad(myId, peerId, contentType, clientId));
+    final out = BytesBuilder(copy: false)
+      ..addByte(kCryptoVersion)
+      ..add(nonce)
+      ..add(box.cipherText)
+      ..add(box.mac.bytes);
+    return out.toBytes();
   }
 
-  /// Получить свой публичный ключ
-  Future<Uint8List> getPublicKey() async {
-    if (_keyPair == null) await init();
-    final publicKey = await _keyPair!.extractPublicKey();
-    return Uint8List.fromList(publicKey.bytes);
-  }
-
-  /// Получить публичный ключ в base64
-  Future<String> getPublicKeyBase64() async {
-    final publicKey = await getPublicKey();
-    return base64Encode(publicKey);
-  }
-
-  // ============ ЭКСПОРТ/ИМПОРТ КЛЮЧЕЙ ДЛЯ DEVICE LINKING ============
-
-  /// Экспортирует ключевую пару в base64 строку (для передачи на новое устройство)
-  Future<String> exportKeyPair() async {
-    if (_keyPair == null) await init();
-    
-    final privateKeyBytes = await _keyPair!.extractPrivateKeyBytes();
-    final publicKey = await _keyPair!.extractPublicKey();
-    
-    final exportData = {
-      'private': base64Encode(Uint8List.fromList(privateKeyBytes)),
-      'public': base64Encode(Uint8List.fromList(publicKey.bytes)),
-    };
-    
-    return base64Encode(utf8.encode(jsonEncode(exportData)));
-  }
-
-  /// Импортирует ключевую пару из base64 строки (на новом устройстве)
-  Future<void> importKeyPair(String exportedData) async {
+  /// Расшифровывает сообщение переписки с [peerId].
+  Future<Uint8List> decryptMessage({
+    required Uint8List blob,
+    required int myId,
+    required int peerId,
+    required int senderId,
+    required int recipientId,
+    required String contentType,
+    required String clientId,
+  }) async {
+    if (blob.length < 1 + 24 + 16 || blob[0] != kCryptoVersion) {
+      throw CryptoException(S.current.unsupportedFormat);
+    }
+    final validPair = (senderId == myId && recipientId == peerId) || (senderId == peerId && recipientId == myId);
+    if (!validPair) throw CryptoException(S.current.foreignMessage);
+    final key = await _sharedKey(myId, peerId);
+    final box = SecretBox(
+      blob.sublist(25, blob.length - 16),
+      nonce: blob.sublist(1, 25),
+      mac: Mac(blob.sublist(blob.length - 16)),
+    );
     try {
-      final jsonStr = utf8.decode(base64Decode(exportedData));
-      final data = jsonDecode(jsonStr) as Map<String, dynamic>;
-      
-      final privateKeyBytes = base64Decode(data['private'] as String);
-      final publicKeyBytes = base64Decode(data['public'] as String);
-      
-      _keyPair = SimpleKeyPairData(
-        privateKeyBytes,
-        publicKey: SimplePublicKey(publicKeyBytes, type: KeyPairType.x25519),
-        type: KeyPairType.x25519,
-      );
-      
-      // Сохраняем импортированные ключи в SecureStorage
-      await _secureStorage.write(key: _privateKeyKey, value: data['private'] as String);
-      await _secureStorage.write(key: _publicKeyKey, value: data['public'] as String);
-      
-      // Удаляем из SharedPreferences на всякий случай
-      final prefs = await SharedPreferences.getInstance();
-      await prefs.remove(_privateKeyKey);
-      await prefs.remove(_publicKeyKey);
-      
-      print('🔐 Imported key pair successfully into secure storage');
-    } catch (e) {
-      print('🔐 Failed to import key pair: $e');
-      rethrow;
+      final clear = await _aead.decrypt(box, secretKey: key, aad: _aad(senderId, recipientId, contentType, clientId));
+      return Uint8List.fromList(clear);
+    } on SecretBoxAuthenticationError {
+      throw CryptoException(S.current.tampered);
     }
   }
 
-  /// Проверяет, есть ли ключи
-  Future<bool> hasKeys() async {
-    String? privateKey = await _secureStorage.read(key: _privateKeyKey);
-    if (privateKey != null) return true;
-
-    final prefs = await SharedPreferences.getInstance();
-    return prefs.getString(_privateKeyKey) != null;
+  /// Сбрасывает всё состояние в памяти (ключи в хранилище не трогает).
+  void resetMemory() {
+    _identity = null;
+    _identityPub = null;
+    _peerKeys.clear();
+    _pendingPeerKeys.clear();
+    _verified.clear();
+    _sharedKeys.clear();
   }
 
-  // ============ СЕССИОННЫЕ ТОКЕНЫ ============
-
-  Future<void> saveSessionToken(String token) async {
-    await _secureStorage.write(key: _sessionTokenKey, value: token);
+  /// Полное удаление всех секретов этого приложения.
+  Future<void> wipeAll() async {
+    await _storage.deleteAll();
+    resetMemory();
   }
 
-  Future<String?> getSessionToken() async {
-    // Check secure storage first
-    String? token = await _secureStorage.read(key: _sessionTokenKey);
-    if (token != null) return token;
-
-    // Check SharedPreferences for migration
-    final prefs = await SharedPreferences.getInstance();
-    token = prefs.getString(_sessionTokenKey);
-    if (token != null) {
-      // Migrate to secure storage
-      await _secureStorage.write(key: _sessionTokenKey, value: token);
-      await prefs.remove(_sessionTokenKey);
-      print('🔐 Migrated session token to secure storage');
+  static int _compare(Uint8List a, Uint8List b) {
+    for (var i = 0; i < a.length && i < b.length; i++) {
+      if (a[i] != b[i]) return a[i] - b[i];
     }
-    return token;
+    return a.length - b.length;
   }
 
-  Future<void> clearSessionToken() async {
-    await _secureStorage.delete(key: _sessionTokenKey);
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.remove(_sessionTokenKey);
-  }
-
-  // ============ ПУБЛИЧНЫЕ КЛЮЧИ ДРУГИХ ЮЗЕРОВ ============
-
-  void setUserPublicKey(int userId, Uint8List publicKeyBytes) {
-    _publicKeys[userId] = SimplePublicKey(publicKeyBytes, type: KeyPairType.x25519);
-    print('🔐 Stored public key for user $userId');
-  }
-
-  void setUserPublicKeyBase64(int userId, String publicKeyBase64) {
-    final bytes = base64Decode(publicKeyBase64);
-    setUserPublicKey(userId, Uint8List.fromList(bytes));
-  }
-
-  bool hasUserPublicKey(int userId) {
-    return _publicKeys.containsKey(userId);
-  }
-
-  // ============ ШИФРОВАНИЕ ============
-
-  Future<Uint8List> encrypt(String plaintext, int recipientId) async {
-    final plaintextBytes = utf8.encode(plaintext);
-    return await encryptBytes(Uint8List.fromList(plaintextBytes), recipientId);
-  }
-
-  Future<String> decrypt(Uint8List encryptedData, int senderId) async {
-    final decryptedBytes = await decryptBytes(encryptedData, senderId);
-    return utf8.decode(decryptedBytes);
-  }
-
-  Future<Uint8List> encryptBytes(Uint8List plainBytes, int recipientId) async {
-    if (_keyPair == null) await init();
-    
-    final recipientPublicKey = _publicKeys[recipientId];
-    if (recipientPublicKey == null) {
-      throw Exception('No public key for user $recipientId');
+  static bool _equal(Uint8List a, Uint8List b) {
+    if (a.length != b.length) return false;
+    var diff = 0;
+    for (var i = 0; i < a.length; i++) {
+      diff |= a[i] ^ b[i];
     }
-
-    final sharedSecret = await _keyExchange.sharedSecretKey(
-      keyPair: _keyPair!,
-      remotePublicKey: recipientPublicKey,
-    );
-
-    final nonce = _cipher.newNonce();
-
-    final secretBox = await _cipher.encrypt(
-      plainBytes,
-      secretKey: sharedSecret,
-      nonce: nonce,
-    );
-
-    final result = Uint8List(nonce.length + secretBox.cipherText.length + secretBox.mac.bytes.length);
-    result.setAll(0, nonce);
-    result.setAll(nonce.length, secretBox.cipherText);
-    result.setAll(nonce.length + secretBox.cipherText.length, secretBox.mac.bytes);
-
-    return result;
+    return diff == 0;
   }
 
-  Future<Uint8List> decryptBytes(Uint8List encryptedData, int senderId) async {
-    if (_keyPair == null) await init();
+  /// Сравнение байтов за постоянное время.
+  static bool equalBytes(Uint8List a, Uint8List b) => _equal(a, b);
+}
 
-    final senderPublicKey = _publicKeys[senderId];
-    if (senderPublicKey == null) {
-      throw Exception('No public key for user $senderId');
-    }
+// ============ LINKING (2-QR) ============
 
-    final sharedSecret = await _keyExchange.sharedSecretKey(
-      keyPair: _keyPair!,
-      remotePublicKey: senderPublicKey,
+/// Эфемерная пара ключей для переноса identity-ключа на новое устройство.
+class EphemeralKey {
+  final Uint8List privateKey;
+  final Uint8List publicKey;
+  EphemeralKey(this.privateKey, this.publicKey);
+
+  static Future<EphemeralKey> generate() async {
+    final seed = Uint8List.fromList(SecretKeyData.random(length: 32).bytes);
+    return EphemeralKey(seed, await CryptoService.publicFromPrivate(seed));
+  }
+}
+
+/// Шифрование identity-ключа при привязке устройства.
+class LinkCrypto {
+  static final _x25519 = X25519();
+  static final _aead = Xchacha20.poly1305Aead();
+  static final _hkdf = Hkdf(hmac: Hmac.sha256(), outputLength: 32);
+
+  static Future<SecretKey> _key(Uint8List myPriv, Uint8List theirPub, String deviceId) async {
+    final kp = await _x25519.newKeyPairFromSeed(myPriv);
+    final shared = await _x25519.sharedSecretKey(
+      keyPair: kp,
+      remotePublicKey: SimplePublicKey(theirPub, type: KeyPairType.x25519),
     );
-
-    const nonceLength = 12;
-    const macLength = 16;
-    
-    if (encryptedData.length < nonceLength + macLength) {
-      throw Exception('Invalid encrypted data: too short');
-    }
-
-    final nonce = encryptedData.sublist(0, nonceLength);
-    final cipherText = encryptedData.sublist(nonceLength, encryptedData.length - macLength);
-    final macBytes = encryptedData.sublist(encryptedData.length - macLength);
-
-    final secretBox = SecretBox(
-      cipherText,
-      nonce: nonce,
-      mac: Mac(macBytes),
+    return _hkdf.deriveKey(
+      secretKey: shared,
+      nonce: utf8.encode('homelan-v2-link'),
+      info: utf8.encode('homelan/v2/link/$deviceId'),
     );
-
-    final decrypted = await _cipher.decrypt(
-      secretBox,
-      secretKey: sharedSecret,
-    );
-
-    return Uint8List.fromList(decrypted);
   }
 
-  Future<void> clearKeys() async {
-    await _secureStorage.delete(key: _privateKeyKey);
-    await _secureStorage.delete(key: _publicKeyKey);
-    await clearSessionToken();
-    
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.remove(_privateKeyKey);
-    await prefs.remove(_publicKeyKey);
-    
-    _keyPair = null;
-    _publicKeys.clear();
-    print('🔐 Cleared all keys from secure storage and preferences');
+  static List<int> _aad(String deviceId, String code) => utf8.encode('homelan/v2/link|$deviceId|$code');
+
+  /// Старое устройство: шифрует identity-ключ для нового устройства.
+  /// Возвращает (эфемерный публичный ключ старого устройства, шифротекст).
+  static Future<(Uint8List, Uint8List)> seal({
+    required Uint8List identityPrivate,
+    required Uint8List newDevicePublic,
+    required String deviceId,
+    required String code,
+  }) async {
+    final eph = await EphemeralKey.generate();
+    final key = await _key(eph.privateKey, newDevicePublic, deviceId);
+    final nonce = _aead.newNonce();
+    final box = await _aead.encrypt(identityPrivate, secretKey: key, nonce: nonce, aad: _aad(deviceId, code));
+    final ct = BytesBuilder(copy: false)
+      ..add(nonce)
+      ..add(box.cipherText)
+      ..add(box.mac.bytes);
+    return (eph.publicKey, ct.toBytes());
+  }
+
+  /// Новое устройство: расшифровывает identity-ключ.
+  static Future<Uint8List> open({
+    required Uint8List ephemeralPrivate,
+    required Uint8List oldDevicePublic,
+    required Uint8List ciphertext,
+    required String deviceId,
+    required String code,
+  }) async {
+    if (ciphertext.length != 24 + 32 + 16) throw CryptoException(S.current.linkDataCorrupt);
+    final key = await _key(ephemeralPrivate, oldDevicePublic, deviceId);
+    final box = SecretBox(ciphertext.sublist(24, ciphertext.length - 16),
+        nonce: ciphertext.sublist(0, 24), mac: Mac(ciphertext.sublist(ciphertext.length - 16)));
+    try {
+      return Uint8List.fromList(await _aead.decrypt(box, secretKey: key, aad: _aad(deviceId, code)));
+    } on SecretBoxAuthenticationError {
+      throw CryptoException(S.current.linkWrongDevice);
+    }
+  }
+
+  /// Короткий код сверки (6 цифр) по эфемерному ключу нового устройства —
+  /// пользователь сравнивает его на обоих экранах.
+  static Future<String> verificationCode(Uint8List ephemeralPublic) async {
+    final h = (await Sha256().hash([...utf8.encode('homelan-v2-sas'), ...ephemeralPublic])).bytes;
+    final n = ((h[0] << 16) | (h[1] << 8) | h[2]) % 1000000;
+    final s = n.toString().padLeft(6, '0');
+    return '${s.substring(0, 3)} ${s.substring(3)}';
   }
 }

@@ -4,6 +4,22 @@ plugins {
     id "dev.flutter.flutter-gradle-plugin"
 }
 
+// Ключ подписи релиза. Источники (по порядку):
+//  1. переменные окружения (CI): HOMELAN_KEYSTORE_FILE, HOMELAN_KEYSTORE_PASSWORD,
+//     HOMELAN_KEY_ALIAS, HOMELAN_KEY_PASSWORD — см. scripts/make-keystore.ps1;
+//  2. android/key.properties (не коммитится): storeFile, storePassword, keyAlias, keyPassword.
+// Без ключа релиз подписывается debug-ключом (только для домашнего теста).
+def keystoreProperties = new Properties()
+def keystorePropertiesFile = rootProject.file("key.properties")
+if (System.getenv("HOMELAN_KEYSTORE_FILE")) {
+    keystoreProperties['storeFile'] = System.getenv("HOMELAN_KEYSTORE_FILE")
+    keystoreProperties['storePassword'] = System.getenv("HOMELAN_KEYSTORE_PASSWORD")
+    keystoreProperties['keyAlias'] = System.getenv("HOMELAN_KEY_ALIAS")
+    keystoreProperties['keyPassword'] = System.getenv("HOMELAN_KEY_PASSWORD")
+} else if (keystorePropertiesFile.exists()) {
+    keystorePropertiesFile.withInputStream { keystoreProperties.load(it) }
+}
+def hasReleaseKey = keystoreProperties['storeFile'] != null
 android {
     namespace "com.homelan.homelan_client"
     compileSdk 36
@@ -27,14 +43,25 @@ android {
         applicationId "com.homelan.homelan_client"
         minSdkVersion flutter.minSdkVersion
         targetSdk 36
-        versionCode 1
-        versionName "0.1.0"
+        versionCode flutter.versionCode
+        versionName flutter.versionName
         multiDexEnabled true
+    }
+
+    signingConfigs {
+        if (hasReleaseKey) {
+            release {
+                storeFile file(keystoreProperties['storeFile'])
+                storePassword keystoreProperties['storePassword']
+                keyAlias keystoreProperties['keyAlias']
+                keyPassword keystoreProperties['keyPassword']
+            }
+        }
     }
 
     buildTypes {
         release {
-            signingConfig signingConfigs.debug
+            signingConfig hasReleaseKey ? signingConfigs.release : signingConfigs.debug
             minifyEnabled false
             shrinkResources false
         }

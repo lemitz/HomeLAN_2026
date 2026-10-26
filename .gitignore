@@ -40,3 +40,13 @@ client/.flutter-plugins
 client/.flutter-plugins-dependencies
 client/build/
 client/pubspec.lock
+
+# Inno Setup output and redistributables
+/installer/
+vc_redist.x64.exe
+
+# CI packaging
+/dist/
+/pkg/
+/homelan-server/build/
+/homelan-server/pkg/

@@ -31,40 +31,42 @@ type MasterKey struct {
 
 // FindMasterKey ищет флешку с ключом
 func FindMasterKey() (*MasterKey, error) {
-	drives := getMountedDrives()
-
-	for _, drive := range drives {
+	for _, drive := range getMountedDrives() {
 		keyPath := filepath.Join(drive, KeyFileName)
-
 		if _, err := os.Stat(keyPath); err == nil {
-			keyHex, err := os.ReadFile(keyPath)
+			mk, err := LoadKeyFile(keyPath)
 			if err != nil {
-				continue
+				return nil, err
 			}
-
-			keyHex = []byte(strings.TrimSpace(string(keyHex)))
-			key, err := hex.DecodeString(string(keyHex))
-			if err != nil {
-				return nil, fmt.Errorf("%w: invalid hex encoding", ErrInvalidKey)
-			}
-
-			if len(key) != KeySize {
-				return nil, fmt.Errorf("%w: expected %d bytes, got %d", ErrInvalidKey, KeySize, len(key))
-			}
-
-			return &MasterKey{
-				Key:     key,
-				KeyPath: keyPath,
-				USBPath: drive,
-			}, nil
+			mk.USBPath = drive
+			return mk, nil
 		}
 	}
-
 	return nil, ErrNoUSBFound
 }
 
-// GenerateKeyFile создаёт новый ключ на указанном USB
-func GenerateKeyFile(usbPath string) (*MasterKey, error) {
+// LoadKeyFile читает ключ из указанного файла (hex, 32 байта).
+func LoadKeyFile(keyPath string) (*MasterKey, error) {
+	keyHex, err := os.ReadFile(keyPath)
+	if err != nil {
+		return nil, fmt.Errorf("read key file: %w", err)
+	}
+	key, err := hex.DecodeString(strings.TrimSpace(string(keyHex)))
+	if err != nil {
+		return nil, fmt.Errorf("%w: invalid hex encoding", ErrInvalidKey)
+	}
+	if len(key) != KeySize {
+		return nil, fmt.Errorf("%w: expected %d bytes, got %d", ErrInvalidKey, KeySize, len(key))
+	}
+	return &MasterKey{Key: key, KeyPath: keyPath, USBPath: filepath.Dir(keyPath)}, nil
+}
+
+// ErrKeyExists — на накопителе уже есть ключ (перезапись уничтожит доступ к БД).
+var ErrKeyExists = errors.New("homelan.key already exists on this drive")
+
+// GenerateKeyFile создаёт новый ключ на указанном USB. Существующий ключ
+// перезаписывается только при force=true.
+func GenerateKeyFile(usbPath string, force bool) (*MasterKey, error) {
 	key := make([]byte, KeySize)
 	if _, err := rand.Read(key); err != nil {
 		return nil, fmt.Errorf("failed to generate random key: %w", err)
@@ -73,8 +75,27 @@ func GenerateKeyFile(usbPath string) (*MasterKey, error) {
 	keyPath := filepath.Join(usbPath, KeyFileName)
 	keyHex := hex.EncodeToString(key)
 
-	if err := os.WriteFile(keyPath, []byte(keyHex+"\n"), 0600); err != nil {
+	flags := os.O_WRONLY | os.O_CREATE | os.O_EXCL
+	if force {
+		flags = os.O_WRONLY | os.O_CREATE | os.O_TRUNC
+	}
+	f, err := os.OpenFile(keyPath, flags, 0600)
+	if os.IsExist(err) {
+		return nil, ErrKeyExists
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to create key file: %w", err)
+	}
+	if _, err := f.WriteString(keyHex + "\n"); err != nil {
+		f.Close()
 		return nil, fmt.Errorf("failed to write key file: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("failed to flush key file: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return nil, fmt.Errorf("failed to close key file: %w", err)
 	}
 
 	return &MasterKey{

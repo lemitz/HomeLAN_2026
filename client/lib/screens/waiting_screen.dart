@@ -1,7 +1,14 @@
+// lib/screens/waiting_screen.dart
 import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
+
+import '../l10n/strings.dart';
 import '../providers/auth_provider.dart';
+import '../theme.dart';
+import '../widgets/ui.dart';
+import 'settings_screen.dart';
 
 class WaitingForPartnerScreen extends StatefulWidget {
   const WaitingForPartnerScreen({super.key});
@@ -10,91 +17,66 @@ class WaitingForPartnerScreen extends StatefulWidget {
   State<WaitingForPartnerScreen> createState() => _WaitingForPartnerScreenState();
 }
 
-class _WaitingForPartnerScreenState extends State<WaitingForPartnerScreen> {
-  Timer? _checkTimer;
+class _WaitingForPartnerScreenState extends State<WaitingForPartnerScreen> with SingleTickerProviderStateMixin {
+  Timer? _timer;
+  bool _checking = false;
+  late final AnimationController _pulse = AnimationController(vsync: this, duration: const Duration(milliseconds: 1600))
+    ..repeat(reverse: true);
 
   @override
   void initState() {
     super.initState();
-    // Проверяем каждые 5 секунд
-    _checkTimer = Timer.periodic(const Duration(seconds: 5), (_) {
-      _checkForPartner();
-    });
+    _timer = Timer.periodic(const Duration(seconds: 5), (_) => _check());
   }
 
   @override
   void dispose() {
-    _checkTimer?.cancel();
+    _timer?.cancel();
+    _pulse.dispose();
     super.dispose();
   }
 
-  Future<void> _checkForPartner() async {
-    final auth = context.read<AuthProvider>();
+  Future<void> _check() async {
+    if (_checking) return;
+    _checking = true;
     try {
-      final partner = await auth.apiService.getPartner(auth.userId!);
-      if (partner != null && mounted) {
-        // Партнёр появился — перезагружаем
-        await auth.init();
-      }
-    } catch (_) {}
+      await context.read<AuthProvider>().refreshPartner();
+    } finally {
+      _checking = false;
+    }
   }
 
   @override
   Widget build(BuildContext context) {
+    final s = S.of(context);
     return Scaffold(
-      backgroundColor: Colors.grey[900],
       appBar: AppBar(
-        title: const Text('HomeLAN'),
+        title: Text(s.appName),
         actions: [
           IconButton(
-            icon: const Icon(Icons.settings),
-            onPressed: () {
-              Navigator.pushNamed(context, '/settings');
-            },
+            icon: const Icon(Icons.settings_outlined),
+            tooltip: s.settings,
+            onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const SettingsScreen())),
           ),
         ],
       ),
       body: Center(
-        child: Padding(
-          padding: const EdgeInsets.all(32),
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              Icon(
-                Icons.hourglass_empty,
-                size: 80,
-                color: Colors.blue[400],
+        child: FadeSlideIn(
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
+            ScaleTransition(
+              scale: Tween(begin: 0.92, end: 1.0).animate(CurvedAnimation(parent: _pulse, curve: Curves.easeInOut)),
+              child: Container(
+                width: 96,
+                height: 96,
+                decoration: BoxDecoration(color: AppColors.accent.withValues(alpha: 0.12), shape: BoxShape.circle),
+                child: const Icon(Icons.person_add_alt_1_outlined, size: 44, color: AppColors.accent),
               ),
-              const SizedBox(height: 24),
-              const Text(
-                'Ожидание собеседника',
-                style: TextStyle(
-                  fontSize: 24,
-                  fontWeight: FontWeight.bold,
-                  color: Colors.white,
-                ),
-              ),
-              const SizedBox(height: 16),
-              Text(
-                'Второй пользователь ещё не зарегистрирован.\n\nПопросите его установить приложение и создать аккаунт.',
-                style: TextStyle(
-                  fontSize: 16,
-                  color: Colors.grey[400],
-                ),
-                textAlign: TextAlign.center,
-              ),
-              const SizedBox(height: 32),
-              const CircularProgressIndicator(),
-              const SizedBox(height: 16),
-              Text(
-                'Проверяем каждые 5 секунд...',
-                style: TextStyle(
-                  fontSize: 12,
-                  color: Colors.grey[600],
-                ),
-              ),
-            ],
-          ),
+            ),
+            const SizedBox(height: 24),
+            Text(s.waitingTitle, style: const TextStyle(fontSize: 22, fontWeight: FontWeight.w600)),
+            const SizedBox(height: 8),
+            Text(s.waitingHint, textAlign: TextAlign.center, style: const TextStyle(color: AppColors.muted)),
+          ]),
         ),
       ),
     );

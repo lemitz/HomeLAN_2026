@@ -23,10 +23,16 @@
     <uses-feature android:name="android.hardware.camera" android:required="false"/>
     <uses-feature android:name="android.hardware.camera.autofocus" android:required="false"/>
 
+    <!-- usesCleartextTraffic: сервер в LAN работает по HTTP (содержимое защищено E2E,
+         ключи собеседника закрепляются и сверяются по отпечатку).
+         allowBackup=false: кеш, токен и настройки не попадают в облачные бэкапы. -->
     <application
         android:label="HomeLAN"
         android:name="${applicationName}"
         android:usesCleartextTraffic="true"
+        android:allowBackup="false"
+        android:fullBackupContent="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
         android:icon="@mipmap/ic_launcher">
         
         <activity
@@ -50,17 +56,6 @@
                 <category android:name="android.intent.category.DEFAULT"/>
             </intent-filter>
         </activity>
-
-        <!-- FileProvider для открытия файлов -->
-        <provider
-            android:name="androidx.core.content.FileProvider"
-            android:authorities="${applicationId}.fileprovider"
-            android:exported="false"
-            android:grantUriPermissions="true">
-            <meta-data
-                android:name="android.support.FILE_PROVIDER_PATHS"
-                android:resource="@xml/file_paths"/>
-        </provider>
 
         <!-- Ресиверы для уведомлений -->
         <receiver 

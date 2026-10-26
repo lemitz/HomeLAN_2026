@@ -1,9 +1,14 @@
+// lib/screens/login_screen.dart
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
+
+import '../l10n/strings.dart';
 import '../providers/providers.dart';
-import '../services/services.dart';
-import 'register_screen.dart';
+import '../theme.dart';
+import '../widgets/server_address.dart';
+import '../widgets/ui.dart';
 import 'new_device_link_screen.dart';
+import 'register_screen.dart';
 
 class LoginScreen extends StatefulWidget {
   const LoginScreen({super.key});
@@ -13,229 +18,125 @@ class LoginScreen extends StatefulWidget {
 }
 
 class _LoginScreenState extends State<LoginScreen> {
-  final _usernameController = TextEditingController();
-  final _passwordController = TextEditingController();
-  bool _obscurePassword = true;
+  final _username = TextEditingController();
+  final _password = TextEditingController();
+  bool _obscure = true;
 
   @override
   void dispose() {
-    _usernameController.dispose();
-    _passwordController.dispose();
+    _username.dispose();
+    _password.dispose();
     super.dispose();
   }
 
   Future<void> _login() async {
-    final username = _usernameController.text.trim();
-    final password = _passwordController.text;
-
-    if (username.isEmpty || password.isEmpty) {
-      _showError('Введите логин и пароль');
+    final s = S.of(context);
+    final username = _username.text.trim();
+    if (username.isEmpty || _password.text.isEmpty) {
+      showSnack(context, s.enterCredentials, error: true);
       return;
     }
-
     final auth = context.read<AuthProvider>();
-    final success = await auth.login(username, password);
-
-    if (success && mounted) {
-      // Навигация теперь происходит автоматически через AppStartup
-      Navigator.of(context).popUntil((route) => route.isFirst);
-    } else if (mounted && auth.error != null) {
-      _showError(auth.error!);
+    final ok = await auth.login(username, _password.text);
+    if (!mounted) return;
+    if (ok) {
+      Navigator.of(context).popUntil((r) => r.isFirst);
+    } else if (auth.error != null) {
+      showSnack(context, auth.error!, error: true);
     }
-  }
-
-  void _showError(String message) {
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(message),
-        backgroundColor: Colors.red[700],
-      ),
-    );
-  }
-
-  void _linkToAccount() {
-    Navigator.push(
-      context,
-      MaterialPageRoute(builder: (_) => const NewDeviceLinkScreen()),
-    );
   }
 
   @override
   Widget build(BuildContext context) {
-    final auth = context.watch<AuthProvider>();
+    final s = S.of(context);
+    final busy = context.select<AuthProvider, bool>((a) => a.isBusy);
+    final notice = context.select<AuthProvider, String?>((a) => a.notice);
 
     return Scaffold(
-      backgroundColor: Colors.grey[900],
       body: SafeArea(
-        child: Center(
-          child: SingleChildScrollView(
-            padding: const EdgeInsets.all(24),
-            child: Column(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                Icon(
-                  Icons.lock_outline,
-                  size: 80,
-                  color: Colors.blue[400],
-                ),
-                const SizedBox(height: 24),
-                const Text(
-                  'HomeLAN',
-                  style: TextStyle(
-                    fontSize: 32,
-                    fontWeight: FontWeight.bold,
-                    color: Colors.white,
-                  ),
-                ),
-                const SizedBox(height: 8),
-                Text(
-                  'Безопасный мессенджер',
-                  style: TextStyle(
-                    fontSize: 16,
-                    color: Colors.grey[400],
-                  ),
-                ),
-                const SizedBox(height: 48),
-                TextField(
-                  controller: _usernameController,
-                  style: const TextStyle(color: Colors.white),
-                  decoration: InputDecoration(
-                    labelText: 'Логин',
-                    labelStyle: TextStyle(color: Colors.grey[400]),
-                    prefixIcon: Icon(Icons.person, color: Colors.grey[400]),
-                    filled: true,
-                    fillColor: Colors.grey[850],
-                    border: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(12),
-                      borderSide: BorderSide.none,
-                    ),
-                    focusedBorder: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(12),
-                      borderSide: BorderSide(color: Colors.blue[400]!),
-                    ),
-                  ),
-                ),
-                const SizedBox(height: 16),
-                TextField(
-                  controller: _passwordController,
-                  obscureText: _obscurePassword,
-                  style: const TextStyle(color: Colors.white),
-                  decoration: InputDecoration(
-                    labelText: 'Пароль',
-                    labelStyle: TextStyle(color: Colors.grey[400]),
-                    prefixIcon: Icon(Icons.lock, color: Colors.grey[400]),
-                    suffixIcon: IconButton(
-                      icon: Icon(
-                        _obscurePassword ? Icons.visibility : Icons.visibility_off,
-                        color: Colors.grey[400],
+        child: NarrowBody(
+          child: AutofillGroup(
+            child: Column(children: [
+              const FadeSlideIn(child: AppLogo(size: 72)),
+              const SizedBox(height: 20),
+              FadeSlideIn(
+                delay: const Duration(milliseconds: 40),
+                child: Text(s.appName, style: const TextStyle(fontSize: 30, fontWeight: FontWeight.w700)),
+              ),
+              const SizedBox(height: 32),
+              AnimatedSize(
+                duration: kMedium,
+                curve: Curves.easeOutCubic,
+                child: notice == null
+                    ? const SizedBox(width: double.infinity)
+                    : Container(
+                        width: double.infinity,
+                        margin: const EdgeInsets.only(bottom: 16),
+                        padding: const EdgeInsets.all(12),
+                        decoration: BoxDecoration(
+                          color: AppColors.warning.withValues(alpha: 0.12),
+                          borderRadius: BorderRadius.circular(14),
+                        ),
+                        child: Text(notice, style: const TextStyle(color: AppColors.warning)),
                       ),
-                      onPressed: () {
-                        setState(() {
-                          _obscurePassword = !_obscurePassword;
-                        });
-                      },
-                    ),
-                    filled: true,
-                    fillColor: Colors.grey[850],
-                    border: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(12),
-                      borderSide: BorderSide.none,
-                    ),
-                    focusedBorder: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(12),
-                      borderSide: BorderSide(color: Colors.blue[400]!),
-                    ),
+              ),
+              FadeSlideIn(
+                delay: const Duration(milliseconds: 80),
+                child: Column(children: [
+                  TextField(
+                    controller: _username,
+                    autofillHints: const [AutofillHints.username],
+                    textInputAction: TextInputAction.next,
+                    decoration: InputDecoration(hintText: s.username, prefixIcon: const Icon(Icons.person_outline)),
                   ),
-                  onSubmitted: (_) => _login(),
-                ),
-                const SizedBox(height: 24),
-                SizedBox(
-                  width: double.infinity,
-                  height: 50,
-                  child: ElevatedButton(
-                    onPressed: auth.isLoading ? null : _login,
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: Colors.blue[600],
-                      shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(12),
+                  const SizedBox(height: 12),
+                  TextField(
+                    controller: _password,
+                    obscureText: _obscure,
+                    autofillHints: const [AutofillHints.password],
+                    onSubmitted: (_) => _login(),
+                    decoration: InputDecoration(
+                      hintText: s.password,
+                      prefixIcon: const Icon(Icons.lock_outline),
+                      suffixIcon: IconButton(
+                        icon: Icon(_obscure ? Icons.visibility_outlined : Icons.visibility_off_outlined),
+                        onPressed: () => setState(() => _obscure = !_obscure),
                       ),
                     ),
-                    child: auth.isLoading
-                        ? const SizedBox(
-                            width: 24,
-                            height: 24,
-                            child: CircularProgressIndicator(
-                              color: Colors.white,
-                              strokeWidth: 2,
-                            ),
-                          )
-                        : const Text(
-                            'Войти',
-                            style: TextStyle(
-                              fontSize: 16,
-                              fontWeight: FontWeight.bold,
-                              color: Colors.white,
-                            ),
-                          ),
                   ),
-                ),
-                const SizedBox(height: 16),
-                TextButton(
-                  onPressed: () {
-                    Navigator.push(
-                      context,
-                      MaterialPageRoute(builder: (_) => const RegisterScreen()),
-                    );
-                  },
-                  child: Text(
-                    'Нет аккаунта? Зарегистрироваться',
-                    style: TextStyle(color: Colors.blue[400]),
+                  const SizedBox(height: 20),
+                  PrimaryButton(label: s.signIn, loading: busy, onPressed: _login),
+                  const SizedBox(height: 8),
+                  TextButton(
+                    onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const RegisterScreen())),
+                    child: Text(s.createAccount),
                   ),
-                ),
-                
-                const SizedBox(height: 32),
-                
-                // Разделитель
-                Row(
-                  children: [
-                    Expanded(child: Divider(color: Colors.grey[700])),
+                ]),
+              ),
+              const SizedBox(height: 16),
+              FadeSlideIn(
+                delay: const Duration(milliseconds: 120),
+                child: Column(children: [
+                  Row(children: [
+                    const Expanded(child: Divider()),
                     Padding(
-                      padding: const EdgeInsets.symmetric(horizontal: 16),
-                      child: Text('или', style: TextStyle(color: Colors.grey[500])),
+                      padding: const EdgeInsets.symmetric(horizontal: 12),
+                      child: Text(s.or, style: const TextStyle(color: AppColors.muted)),
                     ),
-                    Expanded(child: Divider(color: Colors.grey[700])),
-                  ],
-                ),
-                
-                const SizedBox(height: 24),
-                
-                // Кнопка привязки к аккаунту
-                SizedBox(
-                  width: double.infinity,
-                  height: 50,
-                  child: OutlinedButton.icon(
-                    onPressed: _linkToAccount,
-                    icon: const Icon(Icons.link),
-                    label: const Text(
-                      'Привязать к аккаунту',
-                      style: TextStyle(fontSize: 16),
-                    ),
-                    style: OutlinedButton.styleFrom(
-                      foregroundColor: Colors.green[400],
-                      side: BorderSide(color: Colors.green[400]!),
-                      shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(12),
-                      ),
-                    ),
+                    const Expanded(child: Divider()),
+                  ]),
+                  const SizedBox(height: 16),
+                  OutlinedButton.icon(
+                    onPressed: () =>
+                        Navigator.push(context, MaterialPageRoute(builder: (_) => const NewDeviceLinkScreen())),
+                    icon: const Icon(Icons.qr_code_2),
+                    label: Text(s.linkToAccount),
                   ),
-                ),
-                const SizedBox(height: 8),
-                Text(
-                  'Есть аккаунт на другом устройстве?',
-                  style: TextStyle(color: Colors.grey[500], fontSize: 12),
-                ),
-              ],
-            ),
+                  const SizedBox(height: 24),
+                  const ServerAddressField(),
+                ]),
+              ),
+            ]),
           ),
         ),
       ),

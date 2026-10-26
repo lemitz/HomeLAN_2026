@@ -3,6 +3,7 @@
 import 'dart:async';
 import 'dart:io';
 import 'package:flutter/foundation.dart';
+import '../l10n/strings.dart';
 
 enum ServerConnectionState {
   unknown,
@@ -35,27 +36,26 @@ class ConnectionService with ChangeNotifier {
 
   void init(String serverUrl) {
     _serverUrl = serverUrl;
-    print('🛡️ ConnectionService init: $serverUrl');
   }
 
   Future<bool> startMonitoring() async {
     if (_serverUrl.isEmpty) return false;
-    
-    _setState(ServerConnectionState.checking);
-    
+
+    if (_state != ServerConnectionState.connected) _setState(ServerConnectionState.checking);
+    // Таймер работает всегда — при недоступном сервере проверки продолжаются,
+    // и связь восстанавливается автоматически.
+    _startTimer();
+
     final alive = await _checkHealth();
     if (!alive) {
+      _disconnectReason = S.current.serverNotResponding;
       _setState(ServerConnectionState.disconnected);
-      _disconnectReason = 'Сервер недоступен';
       return false;
     }
 
     _failedChecks = 0;
     _lastSuccess = DateTime.now();
     _setState(ServerConnectionState.connected);
-    _startTimer();
-    
-    print('🛡️ Monitoring started');
     return true;
   }
 
@@ -63,13 +63,12 @@ class ConnectionService with ChangeNotifier {
     _healthTimer?.cancel();
     _healthTimer = null;
     _setState(ServerConnectionState.unknown);
-    print('🛡️ Monitoring stopped');
   }
 
   void onServerMessage() {
     _lastSuccess = DateTime.now();
     _failedChecks = 0;
-    
+
     if (_state == ServerConnectionState.disconnected) {
       _setState(ServerConnectionState.connected);
     }
@@ -82,38 +81,34 @@ class ConnectionService with ChangeNotifier {
 
   Future<void> _doCheck() async {
     final alive = await _checkHealth();
-    
+
     if (alive) {
       _failedChecks = 0;
       _lastSuccess = DateTime.now();
-      
-      if (_state == ServerConnectionState.disconnected) {
+
+      if (_state != ServerConnectionState.connected) {
         _setState(ServerConnectionState.connected);
-        print('🛡️ Reconnected!');
       }
     } else {
       _failedChecks++;
-      print('🛡️ Check failed: $_failedChecks/$maxFailedChecks');
-      
-      if (_failedChecks >= maxFailedChecks) {
-        _disconnectReason = 'Сервер не отвечает';
+      if (_failedChecks >= maxFailedChecks || _state != ServerConnectionState.connected) {
+        _disconnectReason = S.current.serverNotResponding;
         _setState(ServerConnectionState.disconnected);
       }
     }
   }
 
   Future<bool> _checkHealth() async {
+    final client = HttpClient()..connectionTimeout = timeout;
     try {
-      final client = HttpClient();
-      client.connectionTimeout = timeout;
-      
-      final request = await client.getUrl(Uri.parse('$_serverUrl/health'));
+      final request = await client.getUrl(Uri.parse('$_serverUrl/health')).timeout(timeout);
       final response = await request.close().timeout(timeout);
-      
-      client.close();
+      await response.drain<void>();
       return response.statusCode == 200;
     } catch (e) {
       return false;
+    } finally {
+      client.close(force: true);
     }
   }
 
@@ -124,7 +119,6 @@ class ConnectionService with ChangeNotifier {
 
   void _setState(ServerConnectionState newState) {
     if (_state != newState) {
-      print('🛡️ State: $_state -> $newState');
       _state = newState;
       notifyListeners();
     }

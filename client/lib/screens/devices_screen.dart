@@ -1,7 +1,12 @@
-import 'dart:io';
+// lib/screens/devices_screen.dart
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
+
+import '../l10n/strings.dart';
 import '../providers/auth_provider.dart';
+import '../services/services.dart';
+import '../theme.dart';
+import '../widgets/ui.dart';
 import 'link_device_screen.dart';
 
 class DevicesScreen extends StatefulWidget {
@@ -13,255 +18,153 @@ class DevicesScreen extends StatefulWidget {
 
 class _DevicesScreenState extends State<DevicesScreen> {
   List<Map<String, dynamic>> _devices = [];
-  bool _isLoading = true;
+  int _maxDevices = 0;
+  bool _loading = true;
   String? _error;
 
   @override
   void initState() {
     super.initState();
-    _loadDevices();
+    _load();
   }
 
-  Future<void> _loadDevices() async {
+  Future<void> _load() async {
     setState(() {
-      _isLoading = true;
+      _loading = true;
       _error = null;
     });
-
     try {
-      final authProvider = context.read<AuthProvider>();
-      final devices = await authProvider.apiService.getDevices(authProvider.userId!);
+      final data = await context.read<AuthProvider>().api.devices();
+      if (!mounted) return;
       setState(() {
-        _devices = devices;
-        _isLoading = false;
+        _devices = (data['devices'] as List).cast<Map<String, dynamic>>();
+        _maxDevices = data['max_devices'] as int? ?? 0;
+        _loading = false;
       });
     } catch (e) {
+      if (!mounted) return;
       setState(() {
-        _error = e.toString();
-        _isLoading = false;
+        _error = e is ApiException ? e.userMessage : S.of(context).serverUnavailable;
+        _loading = false;
       });
     }
   }
 
-  Future<void> _revokeDevice(String deviceId, String deviceName) async {
-    final confirm = await showDialog<bool>(
-      context: context,
-      builder: (context) => AlertDialog(
-        backgroundColor: Colors.grey[850],
-        title: const Text('Отозвать устройство?', style: TextStyle(color: Colors.white)),
-        content: Text(
-          'Устройство "$deviceName" больше не сможет подключаться к аккаунту.',
-          style: const TextStyle(color: Colors.white),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context, false),
-            child: const Text('Отмена'),
-          ),
-          TextButton(
-            onPressed: () => Navigator.pop(context, true),
-            style: TextButton.styleFrom(foregroundColor: Colors.red),
-            child: const Text('Отозвать'),
-          ),
-        ],
-      ),
-    );
-
-    if (confirm != true) return;
-
+  Future<void> _revoke(Map<String, dynamic> device) async {
+    final s = S.of(context);
+    final name = device['device_name'] as String? ?? '';
+    if (!await confirmDialog(context, title: s.revokeTitle, body: s.revokeBody(name), action: s.revoke, danger: true)) {
+      return;
+    }
+    if (!mounted) return;
     try {
-      final authProvider = context.read<AuthProvider>();
-      await authProvider.apiService.revokeDevice(
-        userId: authProvider.userId!,
-        deviceId: deviceId,
-      );
-      _loadDevices();
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Устройство отозвано')),
-        );
-      }
+      await context.read<AuthProvider>().api.revokeDevice(device['device_id'] as String);
+      if (!mounted) return;
+      showSnack(context, s.revoked);
+      _load();
     } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Ошибка: $e')),
-        );
-      }
+      if (mounted) showSnack(context, e is ApiException ? e.userMessage : s.serverUnavailable, error: true);
     }
   }
 
-  void _addDevice() {
-    // Открываем экран добавления устройства (работает и на Windows, и на Android)
-    Navigator.push(
-      context,
-      MaterialPageRoute(builder: (context) => const LinkDeviceScreen()),
-    ).then((_) => _loadDevices());
-  }
-
-  IconData _getDeviceIcon(String deviceType) {
-    switch (deviceType.toLowerCase()) {
-      case 'android':
-        return Icons.phone_android;
-      case 'ios':
-        return Icons.phone_iphone;
-      case 'windows':
-        return Icons.desktop_windows;
-      case 'macos':
-        return Icons.desktop_mac;
-      case 'linux':
-        return Icons.computer;
-      case 'web':
-        return Icons.web;
-      default:
-        return Icons.devices;
-    }
-  }
-
-  String _formatLastSeen(int timestamp) {
-    final date = DateTime.fromMillisecondsSinceEpoch(timestamp * 1000);
-    final now = DateTime.now();
-    final diff = now.difference(date);
-
-    if (diff.inMinutes < 5) return 'Сейчас онлайн';
-    if (diff.inHours < 1) return '${diff.inMinutes} мин назад';
-    if (diff.inDays < 1) return '${diff.inHours} ч назад';
-    if (diff.inDays < 7) return '${diff.inDays} дн назад';
-    return '${date.day}.${date.month}.${date.year}';
-  }
+  static IconData _icon(String type) => switch (type) {
+        'android' => Icons.phone_android,
+        'ios' => Icons.phone_iphone,
+        'windows' => Icons.desktop_windows_outlined,
+        'macos' => Icons.desktop_mac_outlined,
+        _ => Icons.computer,
+      };
 
   @override
   Widget build(BuildContext context) {
-    final authProvider = context.watch<AuthProvider>();
-    final currentDeviceId = authProvider.deviceId;
+    final s = S.of(context);
+    final full = _maxDevices > 0 && _devices.length >= _maxDevices;
+
+    final Widget body;
+    if (_loading) {
+      body = const Center(key: ValueKey('loading'), child: CircularProgressIndicator());
+    } else if (_error != null) {
+      body = Center(
+        key: const ValueKey('error'),
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          Text(_error!, style: const TextStyle(color: AppColors.muted)),
+          const SizedBox(height: 16),
+          OutlinedButton(
+              style: OutlinedButton.styleFrom(minimumSize: const Size(160, 48)),
+              onPressed: _load,
+              child: Text(s.retry)),
+        ]),
+      );
+    } else {
+      body = ListView(key: const ValueKey('list'), padding: const EdgeInsets.only(top: 8, bottom: 96), children: [
+        Group(
+          title: _maxDevices > 0 ? '${_devices.length} / $_maxDevices' : null,
+          children: [
+            for (var i = 0; i < _devices.length; i++)
+              FadeSlideIn(delay: Duration(milliseconds: 30 * i), child: _tile(s, _devices[i])),
+          ],
+        ),
+      ]);
+    }
 
     return Scaffold(
-      backgroundColor: Colors.grey[900],
       appBar: AppBar(
-        backgroundColor: Colors.grey[850],
-        title: const Text('Мои устройства', style: TextStyle(color: Colors.white)),
-        iconTheme: const IconThemeData(color: Colors.white),
-        actions: [
-          IconButton(
-            icon: const Icon(Icons.refresh),
-            onPressed: _loadDevices,
-          ),
-        ],
+        title: Text(s.devices),
+        actions: [IconButton(icon: const Icon(Icons.refresh), onPressed: _loading ? null : _load)],
       ),
-      body: _isLoading
-          ? const Center(child: CircularProgressIndicator())
-          : _error != null
-              ? Center(
-                  child: Column(
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    children: [
-                      Text('Ошибка: $_error', style: const TextStyle(color: Colors.white)),
-                      const SizedBox(height: 16),
-                      ElevatedButton(
-                        onPressed: _loadDevices,
-                        child: const Text('Повторить'),
-                      ),
-                    ],
-                  ),
-                )
-              : _devices.isEmpty
-                  ? Center(
-                      child: Column(
-                        mainAxisAlignment: MainAxisAlignment.center,
-                        children: [
-                          Icon(Icons.devices, size: 64, color: Colors.grey[600]),
-                          const SizedBox(height: 16),
-                          Text(
-                            'Нет устройств',
-                            style: TextStyle(color: Colors.grey[400], fontSize: 18),
-                          ),
-                          const SizedBox(height: 8),
-                          Text(
-                            'Добавьте новое устройство',
-                            style: TextStyle(color: Colors.grey[600]),
-                          ),
-                        ],
-                      ),
-                    )
-                  : ListView.builder(
-                      itemCount: _devices.length,
-                      itemBuilder: (context, index) {
-                        final device = _devices[index];
-                        final isCurrentDevice = device['device_id'] == currentDeviceId;
-                        final isOnline = device['is_online'] == true;
+      body: RefreshIndicator(
+        onRefresh: _load,
+        child: AnimatedSwitcher(duration: kMedium, child: body),
+      ),
+      floatingActionButton: AnimatedScale(
+        scale: _loading || _error != null ? 0 : 1,
+        duration: kMedium,
+        curve: Curves.easeOutBack,
+        child: FloatingActionButton.extended(
+          onPressed: full
+              ? () => showSnack(context, s.deviceLimitReached, error: true)
+              : () => Navigator.push(context, MaterialPageRoute(builder: (_) => const LinkDeviceScreen()))
+                  .then((_) => _load()),
+          icon: const Icon(Icons.add),
+          label: Text(s.addDevice),
+        ),
+      ),
+    );
+  }
 
-                        return ListTile(
-                          leading: Stack(
-                            children: [
-                              Icon(
-                                _getDeviceIcon(device['device_type'] ?? ''),
-                                size: 32,
-                                color: Colors.white,
-                              ),
-                              if (isOnline)
-                                Positioned(
-                                  right: 0,
-                                  bottom: 0,
-                                  child: Container(
-                                    width: 12,
-                                    height: 12,
-                                    decoration: BoxDecoration(
-                                      color: Colors.green,
-                                      shape: BoxShape.circle,
-                                      border: Border.all(
-                                        color: Colors.grey[900]!,
-                                        width: 2,
-                                      ),
-                                    ),
-                                  ),
-                                ),
-                            ],
-                          ),
-                          title: Row(
-                            children: [
-                              Expanded(
-                                child: Text(
-                                  device['device_name'] ?? 'Неизвестное устройство',
-                                  style: const TextStyle(color: Colors.white),
-                                ),
-                              ),
-                              if (isCurrentDevice)
-                                Container(
-                                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
-                                  decoration: BoxDecoration(
-                                    color: Colors.blue.withOpacity(0.2),
-                                    borderRadius: BorderRadius.circular(12),
-                                  ),
-                                  child: const Text(
-                                    'Это устройство',
-                                    style: TextStyle(fontSize: 12, color: Colors.blue),
-                                  ),
-                                ),
-                            ],
-                          ),
-                          subtitle: Text(
-                            _formatLastSeen(device['last_seen'] ?? 0),
-                            style: TextStyle(
-                              color: isOnline ? Colors.green : Colors.grey,
-                            ),
-                          ),
-                          trailing: isCurrentDevice
-                              ? null
-                              : IconButton(
-                                  icon: const Icon(Icons.delete_outline, color: Colors.red),
-                                  onPressed: () => _revokeDevice(
-                                    device['device_id'],
-                                    device['device_name'] ?? 'Устройство',
-                                  ),
-                                ),
-                        );
-                      },
-                    ),
-      floatingActionButton: FloatingActionButton.extended(
-        onPressed: _addDevice,
-        backgroundColor: Colors.blue[600],
-        icon: const Icon(Icons.add, color: Colors.white),
-        label: const Text('Добавить устройство', style: TextStyle(color: Colors.white)),
+  Widget _tile(S s, Map<String, dynamic> d) {
+    final current = d['is_current'] == true;
+    final online = d['is_online'] == true;
+    return ListTile(
+      leading: Stack(clipBehavior: Clip.none, children: [
+        Icon(_icon(d['device_type'] as String? ?? ''), size: 28),
+        if (online)
+          Positioned(
+            right: -2,
+            bottom: -2,
+            child: Container(
+              width: 10,
+              height: 10,
+              decoration: BoxDecoration(
+                color: AppColors.success,
+                shape: BoxShape.circle,
+                border: Border.all(color: AppColors.surface, width: 2),
+              ),
+            ),
+          ),
+      ]),
+      title: Text(d['device_name'] as String? ?? ''),
+      subtitle: Text(
+        current ? s.thisDevice : (online ? s.online : s.lastSeen(d['last_seen'] as int? ?? 0)),
+        style: TextStyle(color: current ? AppColors.accent : AppColors.muted),
       ),
+      trailing: current
+          ? null
+          : IconButton(
+              icon: const Icon(Icons.remove_circle_outline, color: AppColors.danger),
+              tooltip: s.revoke,
+              onPressed: () => _revoke(d),
+            ),
     );
   }
 }

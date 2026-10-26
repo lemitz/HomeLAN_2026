@@ -1,271 +1,173 @@
+// lib/services/websocket_service.dart
 import 'dart:async';
 import 'dart:convert';
-import 'dart:typed_data';
-import 'package:web_socket_channel/web_socket_channel.dart';
+import 'dart:math';
+
+import 'package:flutter/foundation.dart';
+import 'package:web_socket_channel/io.dart';
+
 import 'time_service.dart';
 
-class WebSocketService {
-  final String baseUrl;
-  WebSocketChannel? _channel;
-  
-  final _messageController = StreamController<Map<String, dynamic>>.broadcast();
-  Stream<Map<String, dynamic>> get messages => _messageController.stream;
-  
-  bool _isConnected = false;
-  bool get isConnected => _isConnected;
-  
-  Timer? _pingTimer;
-  Timer? _reconnectTimer;
-  Timer? _timeSyncTimer;  // NEW: Таймер для ресинхронизации времени
-  int _reconnectAttempts = 0;
-  
-  int? _userId;
-  String? _deviceId;
-  String? _token;
+enum WsState { disconnected, connecting, connected }
 
-  // Callback для уведомлений о новых сообщениях
-  Function(Map<String, dynamic> message)? onNewMessage;
+/// WebSocket-канал с автоматическим переподключением.
+///
+/// Токен передаётся в заголовке Authorization (не в URL). После каждого
+/// успешного подключения вызывается [onConnected] — там клиент
+/// досинхронизируется и отправляет outbox.
+class WebSocketService extends ChangeNotifier {
+  String baseUrl;
 
   WebSocketService({required this.baseUrl});
 
-  Future<void> connect({
-    required int userId,
-    required String deviceId,
-    required String token,
-  }) async {
-    _userId = userId;
-    _deviceId = deviceId;
+  IOWebSocketChannel? _channel;
+  StreamSubscription? _sub;
+  Timer? _reconnectTimer;
+  int _attempts = 0;
+  String? _token;
+  bool _running = false;
+  int _generation = 0;
+
+  WsState _state = WsState.disconnected;
+  WsState get state => _state;
+  bool get isConnected => _state == WsState.connected;
+
+  final _messages = StreamController<Map<String, dynamic>>.broadcast();
+  Stream<Map<String, dynamic>> get messages => _messages.stream;
+
+  /// Вызывается после каждого успешного подключения.
+  VoidCallback? onConnected;
+
+  /// Вызывается, если сервер отверг сессию (401) — нужно перелогиниться.
+  VoidCallback? onUnauthorized;
+
+  final _random = Random();
+
+  void start(String token) {
     _token = token;
-    _reconnectAttempts = 0;
-    
-    await _doConnect();
+    _running = true;
+    _attempts = 0;
+    _connect();
   }
 
-  Future<void> _doConnect() async {
-    if (_userId == null || _deviceId == null) return;
-    
+  /// Полностью останавливает канал (без переподключений).
+  void stop() {
+    _running = false;
+    _generation++;
+    _reconnectTimer?.cancel();
+    _sub?.cancel();
+    _channel?.sink.close();
+    _channel = null;
+    _setState(WsState.disconnected);
+  }
+
+  /// Немедленная попытка переподключения (например, при возврате в приложение).
+  void reconnectNow() {
+    if (!_running || _state != WsState.disconnected) return;
+    _reconnectTimer?.cancel();
+    _attempts = 0;
+    _connect();
+  }
+
+  Future<void> _connect() async {
+    if (!_running || _token == null) return;
+    final gen = ++_generation;
+    _setState(WsState.connecting);
+
+    final wsUrl = baseUrl.replaceFirst(RegExp(r'^http'), 'ws');
+    final channel = IOWebSocketChannel.connect(
+      Uri.parse('$wsUrl/ws'),
+      headers: {'Authorization': 'Bearer $_token'},
+      pingInterval: const Duration(seconds: 25),
+      connectTimeout: const Duration(seconds: 10),
+    );
+
     try {
-      final wsUrl = baseUrl.replaceFirst('http', 'ws');
-      final uri = Uri.parse('$wsUrl/ws?user_id=$_userId&device_id=$_deviceId&token=$_token');
-      
-      _channel = WebSocketChannel.connect(uri);
-      
-      _channel!.stream.listen(
-        (data) {
-          _isConnected = true;
-          _reconnectAttempts = 0;
-          
-          final message = jsonDecode(data as String);
-          
-          // NEW: Синхронизируем время из любого ответа сервера
-          _syncTimeFromMessage(message);
-          
-          // Вызываем callback для новых сообщений (для уведомлений)
-          if (message['type'] == 'new_message' && onNewMessage != null) {
-            onNewMessage!(message['data']);
-          }
-          
-          _messageController.add(message);
-        },
-        onError: (error) {
-          print('WebSocket error: $error');
-          _isConnected = false;
-          _scheduleReconnect();
-        },
-        onDone: () {
-          print('WebSocket closed');
-          _isConnected = false;
-          _scheduleReconnect();
-        },
-      );
-      
-      _isConnected = true;
-      _startPingTimer();
-      _startTimeSyncTimer();  // NEW
-      
-      // NEW: Запрашиваем время сразу при подключении
-      _requestTimeSync();
-      
-      print('WebSocket connected');
+      await channel.ready;
     } catch (e) {
-      print('WebSocket connection error: $e');
-      _isConnected = false;
+      if (gen != _generation) return;
+      // dart:io сообщает код ответа в тексте исключения (обёрнутого в
+      // WebSocketChannelException), отдельного поля нет.
+      if (e.toString().contains('status code: 401')) {
+        debugPrint('WS: unauthorized');
+        _running = false;
+        _setState(WsState.disconnected);
+        onUnauthorized?.call();
+        return;
+      }
+      debugPrint('WS connect failed: $e');
       _scheduleReconnect();
-    }
-  }
-
-  // NEW: Синхронизация времени из сообщения сервера
-  void _syncTimeFromMessage(Map<String, dynamic> message) {
-    // Проверяем server_time в корне сообщения
-    if (message['server_time'] != null) {
-      TimeService().syncFromServerResponse(message['server_time']);
       return;
     }
-    
-    // Проверяем в data
-    if (message['data'] != null && message['data']['server_time'] != null) {
-      TimeService().syncFromServerResponse(message['data']['server_time']);
+    if (gen != _generation) {
+      channel.sink.close();
       return;
     }
-    
-    // Для pong ответа
-    if (message['type'] == 'pong' && message['timestamp'] != null) {
-      TimeService().syncFromServerResponse(message['timestamp']);
-    }
-  }
 
-  // NEW: Периодическая ресинхронизация времени (каждые 6 часов)
-  void _startTimeSyncTimer() {
-    _timeSyncTimer?.cancel();
-    _timeSyncTimer = Timer.periodic(const Duration(hours: 6), (_) {
-      if (_isConnected) {
-        _requestTimeSync();
-      }
-    });
-  }
-
-  // NEW: Запрос времени сервера
-  void _requestTimeSync() {
-    send({
-      'type': 'time_sync',
-      'data': {
-        'client_time': DateTime.now().millisecondsSinceEpoch ~/ 1000,
+    _channel = channel;
+    _attempts = 0;
+    _sub = channel.stream.listen(
+      (data) {
+        try {
+          final msg = jsonDecode(data as String) as Map<String, dynamic>;
+          final payload = msg['data'];
+          if (payload is Map && payload['server_time'] is int) {
+            TimeService().syncFromServerResponse(payload['server_time'] as int);
+          }
+          _messages.add(msg);
+        } catch (e) {
+          debugPrint('WS bad frame: $e');
+        }
       },
-    });
+      onError: (e) {
+        if (gen == _generation) _onClosed();
+      },
+      onDone: () {
+        if (gen == _generation) _onClosed();
+      },
+      cancelOnError: true,
+    );
+    _setState(WsState.connected);
+    send('time_sync', {});
+    onConnected?.call();
   }
 
-  void _startPingTimer() {
-    _pingTimer?.cancel();
-    _pingTimer = Timer.periodic(const Duration(seconds: 25), (_) {
-      if (_isConnected) {
-        send({'type': 'ping', 'data': {}});
-      }
-    });
+  void _onClosed() {
+    _sub?.cancel();
+    _channel = null;
+    _setState(WsState.disconnected);
+    _scheduleReconnect();
   }
 
   void _scheduleReconnect() {
+    if (!_running) return;
+    _setState(WsState.disconnected);
     _reconnectTimer?.cancel();
-    _timeSyncTimer?.cancel();  // NEW: Останавливаем sync при дисконнекте
-    
-    // Exponential backoff: 1s, 2s, 4s, 8s, max 30s
-    final delay = Duration(
-      seconds: (_reconnectAttempts < 5) 
-          ? (1 << _reconnectAttempts) 
-          : 30,
-    );
-    
-    _reconnectAttempts++;
-    
-    _reconnectTimer = Timer(delay, () {
-      if (!_isConnected && _userId != null) {
-        print('Reconnecting (attempt $_reconnectAttempts)...');
-        _doConnect();
-      }
-    });
+    // Экспоненциальная задержка 1..30 с + случайный разброс.
+    final base = min(30, 1 << min(_attempts, 5));
+    final delay = Duration(milliseconds: base * 1000 + _random.nextInt(1000));
+    _attempts++;
+    _reconnectTimer = Timer(delay, _connect);
   }
 
-  void send(Map<String, dynamic> message) {
-    if (_channel != null && _isConnected) {
-      _channel!.sink.add(jsonEncode(message));
-    }
+  void _setState(WsState s) {
+    if (_state == s) return;
+    _state = s;
+    notifyListeners();
   }
 
-  void sendMessage({
-    required int recipientId,
-    required String content,
-    String contentType = 'text',
-    String? fileId,
-  }) {
-    send({
-      'type': 'send_message',
-      'data': {
-        'recipient_id': recipientId,
-        'encrypted_content': base64Encode(utf8.encode(content)),
-        'content_type': contentType,
-        'timestamp': TimeService().getNow(),  // NEW: Используем синхронизированное время
-        if (fileId != null) 'file_id': fileId,
-      },
-    });
+  /// Отправляет сообщение. Возвращает false, если канал не подключён.
+  bool send(String type, Map<String, dynamic> data) {
+    final ch = _channel;
+    if (ch == null || _state != WsState.connected) return false;
+    ch.sink.add(jsonEncode({'type': type, 'data': data}));
+    return true;
   }
 
-  void sendEncryptedMessage({
-    required int recipientId,
-    required Uint8List encryptedContent,
-    String contentType = 'encrypted',
-    String? fileId,
-  }) {
-    send({
-      'type': 'send_message',
-      'data': {
-        'recipient_id': recipientId,
-        'encrypted_content': base64Encode(encryptedContent),
-        'content_type': contentType,
-        'timestamp': TimeService().getNow(),  // NEW: Используем синхронизированное время
-        if (fileId != null) 'file_id': fileId,
-      },
-    });
-  }
-
-  void sync({int sinceSeqId = 0, int limit = 100}) {
-    send({
-      'type': 'sync',
-      'data': {
-        'since_seq_id': sinceSeqId,
-        'limit': limit,
-      },
-    });
-  }
-
-  void syncBefore({required int beforeSeqId, int limit = 50}) {
-    send({
-      'type': 'sync',
-      'data': {
-        'before_seq_id': beforeSeqId,
-        'limit': limit,
-      },
-    });
-  }
-
-  void ack(int seqId) {
-    send({
-      'type': 'ack',
-      'data': {'seq_id': seqId},
-    });
-  }
-
-  void markRead(int seqId) {
-    send({
-      'type': 'read',
-      'data': {'seq_id': seqId},
-    });
-  }
-
-  void deleteMessage(int seqId) {
-    send({
-      'type': 'delete',
-      'data': {'seq_id': seqId},
-    });
-  }
-
-  void sendTyping(int recipientId) {
-    send({
-      'type': 'typing',
-      'data': {
-        'recipient_id': recipientId,
-      },
-    });
-  }
-
-  void disconnect() {
-    _pingTimer?.cancel();
-    _reconnectTimer?.cancel();
-    _timeSyncTimer?.cancel();  // NEW
-    _channel?.sink.close();
-    _isConnected = false;
-  }
-
+  @override
   void dispose() {
-    disconnect();
-    _messageController.close();
+    stop();
+    _messages.close();
+    super.dispose();
   }
 }

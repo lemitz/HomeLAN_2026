@@ -1,164 +1,261 @@
 package db
 
 import (
-	"crypto/rand"
-	"io"
-	"os"
+	"bytes"
+	"errors"
+	"path/filepath"
 	"testing"
 	"time"
-
-	"golang.org/x/crypto/bcrypt"
 )
 
-func TestUserAndPasswordMigration(t *testing.T) {
-	// Create an encrypted database file in a temporary folder
-	tempFile, err := os.CreateTemp("", "messages*.db")
+var testKey = bytes.Repeat([]byte{0x42}, 32)
+
+func openTest(t *testing.T) (*Database, string) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "test.db")
+	d, err := New(path, testKey)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("open db: %v", err)
 	}
-	defer os.Remove(tempFile.Name())
-	tempFile.Close()
+	t.Cleanup(func() { d.Close() })
+	return d, path
+}
 
-	key := make([]byte, 32)
-	io.ReadFull(rand.Reader, key)
-
-	database, err := New(tempFile.Name(), key)
+func register(t *testing.T, d *Database, name, device string) int64 {
+	t.Helper()
+	u, dev, err := d.RegisterUser(RegisterParams{
+		Username: name, PasswordHash: "h", PublicKey: bytes.Repeat([]byte{1}, 32),
+		DeviceID: device, DeviceName: "dev", DeviceType: "android", MaxUsers: 2,
+	})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("register %s: %v", name, err)
 	}
-	defer database.Close()
+	if dev.UserID != u.ID {
+		t.Fatal("device not bound to user")
+	}
+	return u.ID
+}
 
-	// 1. Create a user with raw/plaintext password for migration simulation
-	username := "legacy_user"
-	plaintextPassword := "secret_legacy_123"
+func TestWrongKeyAndSchemaVersion(t *testing.T) {
+	d, path := openTest(t)
+	register(t, d, "alice", "dev-alice-000000000")
+	d.Close()
 
-	// CreateUser expects password hash. Let's insert a plaintext password first into DB
-	// to simulate pre-migration state.
-	now := time.Now().Unix()
-	_, err = database.conn.Exec(
-		`INSERT INTO users (username, password_hash, created_at, last_seen, is_admin) 
-		 VALUES (?, ?, ?, ?, 0)`,
-		username, plaintextPassword, now, now,
-	)
+	if _, err := New(path, bytes.Repeat([]byte{0x13}, 32)); err == nil {
+		t.Fatal("expected error with wrong key")
+	}
+	d2, err := New(path, testKey)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("reopen with right key: %v", err)
 	}
+	d2.Close()
+}
 
-	// 2. Fetch user and verify they have legacy plaintext password
-	user, err := database.GetUserByUsername(username)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if user == nil {
-		t.Fatal("user not found")
-	}
-	if user.PasswordHash != plaintextPassword {
-		t.Errorf("expected plaintext password, got %s", user.PasswordHash)
-	}
+func TestRegisterRules(t *testing.T) {
+	d, _ := openTest(t)
+	alice := register(t, d, "alice", "dev-alice-000000000")
 
-	// 3. Simulate migration: check if password matches as plaintext
-	isCorrect := false
-	err = bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(plaintextPassword))
-	if err != nil {
-		// Compare as plaintext
-		if user.PasswordHash == plaintextPassword {
-			isCorrect = true
-			// Migrate to secure hash
-			hashedBytes, hashErr := bcrypt.GenerateFromPassword([]byte(plaintextPassword), bcrypt.DefaultCost)
-			if hashErr == nil {
-				err = database.UpdateUserPassword(user.ID, string(hashedBytes))
-				if err != nil {
-					t.Fatal(err)
-				}
-				// Refresh in-memory password hash
-				user.PasswordHash = string(hashedBytes)
-			}
-		}
+	admin, _ := d.GetAdmin()
+	if admin == nil || admin.ID != alice {
+		t.Fatal("first user must be admin")
 	}
 
-	if !isCorrect {
-		t.Fatal("migration comparison failed")
+	p := RegisterParams{Username: "ALICE", PasswordHash: "h", PublicKey: make([]byte, 32),
+		DeviceID: "dev-other-000000000", DeviceName: "x", DeviceType: "android", MaxUsers: 2}
+	if _, _, err := d.RegisterUser(p); !errors.Is(err, ErrUsernameTaken) {
+		t.Fatalf("usernames must be case-insensitive unique, got %v", err)
 	}
 
-	// 4. Verify password is now secure bcrypt hash in database
-	userMigrated, err := database.GetUserByUsername(username)
-	if err != nil {
-		t.Fatal(err)
+	p.Username, p.DeviceID = "bob", "dev-alice-000000000"
+	if _, _, err := d.RegisterUser(p); !errors.Is(err, ErrDeviceExists) {
+		t.Fatalf("must not steal existing device, got %v", err)
 	}
-	err = bcrypt.CompareHashAndPassword([]byte(userMigrated.PasswordHash), []byte(plaintextPassword))
-	if err != nil {
-		t.Errorf("failed to verify migrated bcrypt password: %v", err)
+	if n, _ := d.GetUserCount(); n != 1 {
+		t.Fatalf("failed registration must not leave orphan user, users=%d", n)
 	}
 
-	// 5. Test creation of a new user (which automatically hashes)
-	newUser, err := database.CreateUser("new_user", "secure_pwd_456", false)
-	if err != nil {
-		t.Fatal(err)
+	register(t, d, "bob", "dev-bob-00000000000")
+	p.Username, p.DeviceID = "carol", "dev-carol-000000000"
+	if _, _, err := d.RegisterUser(p); !errors.Is(err, ErrUserLimit) {
+		t.Fatalf("expected user limit, got %v", err)
 	}
-	err = bcrypt.CompareHashAndPassword([]byte(newUser.PasswordHash), []byte("secure_pwd_456"))
-	if err != nil {
-		t.Errorf("expected newly created user to have hashed password: %v", err)
+	bobUser, _ := d.GetUserByUsername("bob")
+	if bobUser.IsAdmin {
+		t.Fatal("second user must not be admin")
 	}
 }
 
-func TestSessions(t *testing.T) {
-	tempFile, err := os.CreateTemp("", "messages*.db")
+func TestDevicesAndSessions(t *testing.T) {
+	d, _ := openTest(t)
+	alice := register(t, d, "alice", "dev-alice-000000000")
+
+	if _, err := d.CreateDevice(alice, "dev-alice-000000000", "x", "windows", 3); !errors.Is(err, ErrDeviceExists) {
+		t.Fatalf("expected ErrDeviceExists, got %v", err)
+	}
+	if _, err := d.CreateDevice(alice, "dev-alice-pc0000000", "PC", "windows", 2); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.CreateDevice(alice, "dev-alice-pc2000000", "PC2", "windows", 2); !errors.Is(err, ErrDeviceLimit) {
+		t.Fatalf("expected device limit, got %v", err)
+	}
+
+	if _, err := d.CreateSession(alice, "dev-alice-pc0000000", "hash1", time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.RevokeDevice("dev-alice-pc0000000"); err != nil {
+		t.Fatal(err)
+	}
+	s, _ := d.GetSessionByTokenHash("hash1")
+	if s == nil || !s.IsRevoked {
+		t.Fatal("revoking a device must revoke its sessions")
+	}
+	if n, _ := d.CountActiveDevices(alice); n != 1 {
+		t.Fatalf("expected 1 active device, got %d", n)
+	}
+	// После отзыва место освобождается.
+	if _, err := d.CreateDevice(alice, "dev-alice-pc2000000", "PC2", "windows", 2); err != nil {
+		t.Fatalf("slot should be free after revoke: %v", err)
+	}
+}
+
+func msg(sender, recipient int64, clientID string) NewMessage {
+	return NewMessage{SenderID: sender, SenderDevice: "d", RecipientID: recipient, ClientID: clientID,
+		EncryptedContent: []byte{2, 1, 2, 3}, ContentType: "text"}
+}
+
+func TestMessagesSyncTombstonesAndStatus(t *testing.T) {
+	d, _ := openTest(t)
+	alice := register(t, d, "alice", "dev-alice-000000000")
+	bob := register(t, d, "bob", "dev-bob-00000000000")
+
+	m1, dup, err := d.InsertMessage(msg(alice, bob, "c1"))
+	if err != nil || dup {
+		t.Fatalf("insert: %v dup=%v", err, dup)
+	}
+	again, dup, err := d.InsertMessage(msg(alice, bob, "c1"))
+	if err != nil || !dup || again.SeqID != m1.SeqID {
+		t.Fatalf("resend must be idempotent: %v dup=%v", err, dup)
+	}
+	m2, _, _ := d.InsertMessage(msg(bob, alice, "c1")) // тот же client_id у другого отправителя — ок
+
+	changes, _ := d.ChangesSince(bob, 0, 100)
+	if len(changes) != 2 {
+		t.Fatalf("expected 2 changes, got %d", len(changes))
+	}
+	cursor := changes[len(changes)-1].ChangeSeq
+
+	// Доставка: только получатель может отметить.
+	if m, _ := d.MarkDelivered(m1.SeqID, alice); m != nil {
+		t.Fatal("sender must not mark own message delivered")
+	}
+	if m, _ := d.MarkDelivered(m1.SeqID, bob); m == nil || m.DeliveredAt == 0 {
+		t.Fatal("recipient should mark delivered")
+	}
+	if m, _ := d.MarkDelivered(m1.SeqID, bob); m != nil {
+		t.Fatal("second delivery mark must be a no-op")
+	}
+
+	read, _ := d.MarkReadUpTo(alice, m2.SeqID)
+	if len(read) != 1 || read[0].SeqID != m2.SeqID || read[0].ReadAt == 0 {
+		t.Fatalf("expected m2 read, got %+v", read)
+	}
+
+	// Удаление: только отправитель; tombstone приходит в синке.
+	if _, _, err := d.DeleteMessage(m1.SeqID, bob); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("expected forbidden, got %v", err)
+	}
+	tomb, _, err := d.DeleteMessage(m1.SeqID, alice)
+	if err != nil || !tomb.IsDeleted || len(tomb.EncryptedContent) != 0 {
+		t.Fatalf("bad tombstone: %+v %v", tomb, err)
+	}
+
+	changes, _ = d.ChangesSince(bob, cursor, 100)
+	foundTomb := false
+	for _, c := range changes {
+		if c.ChangeSeq <= cursor {
+			t.Fatal("changes must be after cursor")
+		}
+		if c.SeqID == m1.SeqID && c.IsDeleted {
+			foundTomb = true
+		}
+	}
+	if !foundTomb {
+		t.Fatal("tombstone must be delivered by sync after cursor")
+	}
+
+	hist, _ := d.HistoryBefore(alice, m2.SeqID+1, 10)
+	if len(hist) != 1 || hist[0].SeqID != m2.SeqID {
+		t.Fatalf("history must skip deleted messages, got %d", len(hist))
+	}
+}
+
+func TestExpiredMessages(t *testing.T) {
+	d, _ := openTest(t)
+	alice := register(t, d, "alice", "dev-alice-000000000")
+	bob := register(t, d, "bob", "dev-bob-00000000000")
+	n := msg(alice, bob, "x")
+	n.ExpiresAt = time.Now().Add(-time.Minute).Unix()
+	if _, _, err := d.InsertMessage(n); err != nil {
+		t.Fatal(err)
+	}
+	expired, _, err := d.DeleteExpiredMessages()
+	if err != nil || len(expired) != 1 || !expired[0].IsDeleted {
+		t.Fatalf("expected one expired tombstone, got %v %v", expired, err)
+	}
+}
+
+func TestFileAttachmentAndAccess(t *testing.T) {
+	d, _ := openTest(t)
+	alice := register(t, d, "alice", "dev-alice-000000000")
+	bob := register(t, d, "bob", "dev-bob-00000000000")
+
+	if err := d.CreateFile("f1", alice, 10, "/tmp/f1", 0); err != nil {
+		t.Fatal(err)
+	}
+	f, _ := d.GetFile("f1")
+	if ok, _ := d.CanAccessFile(f, bob); ok {
+		t.Fatal("bob must not access unattached file")
+	}
+
+	m := msg(alice, bob, "file")
+	m.ContentType, m.FileID = "image", "f1"
+	bobFile := m
+	bobFile.SenderID, bobFile.RecipientID, bobFile.ClientID = bob, alice, "steal"
+	if _, _, err := d.InsertMessage(bobFile); !errors.Is(err, ErrFileUnusable) {
+		t.Fatalf("must not attach someone else's file, got %v", err)
+	}
+	sent, _, err := d.InsertMessage(m)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer os.Remove(tempFile.Name())
-	tempFile.Close()
-
-	key := make([]byte, 32)
-	io.ReadFull(rand.Reader, key)
-
-	database, err := New(tempFile.Name(), key)
-	if err != nil {
-		t.Fatal(err)
+	if ok, _ := d.CanAccessFile(f, bob); !ok {
+		t.Fatal("recipient must access attached file")
 	}
-	defer database.Close()
-
-	user, err := database.CreateUser("test_user", "password123", false)
-	if err != nil {
-		t.Fatal(err)
+	m.ClientID = "again"
+	if _, _, err := d.InsertMessage(m); !errors.Is(err, ErrFileUnusable) {
+		t.Fatalf("file must be attachable only once, got %v", err)
 	}
 
-	// Create Session
-	tokenHash := "some_sha256_hash_of_token"
-	session, err := database.CreateSession(user.ID, "device_001", tokenHash, 1*time.Hour)
-	if err != nil {
-		t.Fatal(err)
+	_, fileID, _ := d.DeleteMessage(sent.SeqID, alice)
+	if fileID != "f1" {
+		t.Fatalf("delete must return attached file id, got %q", fileID)
 	}
-	if session.UserID != user.ID {
-		t.Errorf("expected userID %d, got %d", user.ID, session.UserID)
+	if ok, _ := d.CanAccessFile(f, bob); ok {
+		t.Fatal("access must end after message deletion")
 	}
-	if session.TokenHash != tokenHash {
-		t.Errorf("expected tokenHash %s, got %s", tokenHash, session.TokenHash)
+	path, _ := d.MarkFileDeleted("f1")
+	if path != "/tmp/f1" {
+		t.Fatalf("unexpected path %q", path)
 	}
+}
 
-	// Fetch Session
-	s, err := database.GetSessionByTokenHash(tokenHash)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if s == nil {
-		t.Fatal("expected session to be found")
-	}
-	if s.DeviceID != "device_001" {
-		t.Errorf("expected deviceID device_001, got %s", s.DeviceID)
-	}
-
-	// Revoke Session
-	err = database.RevokeSession(tokenHash)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	sRevoked, err := database.GetSessionByTokenHash(tokenHash)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !sRevoked.IsRevoked {
-		t.Error("expected session to be revoked")
+func TestOrphanFilesCollected(t *testing.T) {
+	d, _ := openTest(t)
+	alice := register(t, d, "alice", "dev-alice-000000000")
+	d.CreateFile("orphan", alice, 1, "/tmp/orphan", 0)
+	d.conn.Exec(`UPDATE files SET created_at = created_at - 100000 WHERE id = 'orphan'`)
+	paths, err := d.CollectGarbageFiles(24 * time.Hour)
+	if err != nil || len(paths) != 1 || paths[0] != "/tmp/orphan" {
+		t.Fatalf("expected orphan collected, got %v %v", paths, err)
 	}
 }

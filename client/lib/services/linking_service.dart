@@ -1,115 +1,127 @@
+// lib/services/linking_service.dart
+//
+// Форматы данных для привязки устройства (2-QR + текстовый fallback).
+//
+// QR#1 (новое устройство → старое): device_id, имя, тип, эфемерный ключ.
+// QR#2 (старое → новое): код привязки + identity-ключ, зашифрованный
+//       эфемерным ключом нового устройства. Сервер ключ не видит.
+//
+// Текстовый вид — то же содержимое: "HL1:" / "HL2:" + base64url(JSON).
 import 'dart:convert';
+import 'dart:io';
 import 'dart:math';
-import 'package:flutter/foundation.dart';
+import 'dart:typed_data';
 
-/// Данные для QR #1 (показывает новое устройство)
-class DeviceLinkRequest {
+class LinkRequest {
   final String deviceId;
   final String deviceName;
   final String deviceType;
-  final String? publicKey;
+  final Uint8List ephemeralPublic;
 
-  DeviceLinkRequest({
+  LinkRequest({
     required this.deviceId,
     required this.deviceName,
     required this.deviceType,
-    this.publicKey,
+    required this.ephemeralPublic,
   });
 
-  String toJson() => jsonEncode({
-    'type': 'link_request',
-    'device_id': deviceId,
-    'device_name': deviceName,
-    'device_type': deviceType,
-    if (publicKey != null) 'public_key': publicKey,
-  });
+  String encode() => 'HL1:${base64Url.encode(utf8.encode(jsonEncode({
+            'v': 2,
+            'd': deviceId,
+            'n': deviceName,
+            't': deviceType,
+            'k': base64Encode(ephemeralPublic),
+          })))}';
 
-  static DeviceLinkRequest? fromJson(String json) {
+  static LinkRequest? tryParse(String input) {
+    final data = _decode(input, 'HL1:');
+    if (data == null || data['v'] != 2) return null;
     try {
-      final data = jsonDecode(json);
-      if (data['type'] != 'link_request') return null;
-      return DeviceLinkRequest(
-        deviceId: data['device_id'],
-        deviceName: data['device_name'],
-        deviceType: data['device_type'],
-        publicKey: data['public_key'],
+      final key = base64Decode(data['k'] as String);
+      if (key.length != 32) return null;
+      return LinkRequest(
+        deviceId: data['d'] as String,
+        deviceName: data['n'] as String? ?? '',
+        deviceType: data['t'] as String,
+        ephemeralPublic: key,
       );
-    } catch (e) {
+    } catch (_) {
       return null;
     }
   }
 }
 
-/// Данные для QR #2 (показывает старое устройство)
-class DeviceLinkCode {
+class LinkResponse {
   final String code;
+  final Uint8List ephemeralPublic;
+  final Uint8List ciphertext;
 
-  DeviceLinkCode({required this.code});
+  LinkResponse({required this.code, required this.ephemeralPublic, required this.ciphertext});
 
-  String toJson() => jsonEncode({
-    'type': 'link_code',
-    'code': code,
-  });
+  String encode() => 'HL2:${base64Url.encode(utf8.encode(jsonEncode({
+            'v': 2,
+            'c': code,
+            'k': base64Encode(ephemeralPublic),
+            'e': base64Encode(ciphertext),
+          })))}';
 
-  static DeviceLinkCode? fromJson(String json) {
+  static LinkResponse? tryParse(String input) {
+    final data = _decode(input, 'HL2:');
+    if (data == null || data['v'] != 2) return null;
     try {
-      final data = jsonDecode(json);
-      if (data['type'] != 'link_code') return null;
-      return DeviceLinkCode(code: data['code']);
-    } catch (e) {
+      return LinkResponse(
+        code: data['c'] as String,
+        ephemeralPublic: base64Decode(data['k'] as String),
+        ciphertext: base64Decode(data['e'] as String),
+      );
+    } catch (_) {
       return null;
     }
   }
 }
 
-/// Сервис для работы с привязкой устройств
-class LinkingService {
-  /// Генерирует уникальный ID устройства
-  static String generateDeviceId() {
-    final random = Random.secure();
-    final bytes = List<int>.generate(16, (_) => random.nextInt(256));
-    return base64Url.encode(bytes).substring(0, 22);
+Map<String, dynamic>? _decode(String input, String prefix) {
+  final s = input.replaceAll(RegExp(r'\s'), '');
+  if (!s.startsWith(prefix)) return null;
+  try {
+    final json = utf8.decode(base64Url.decode(base64Url.normalize(s.substring(prefix.length))));
+    final data = jsonDecode(json);
+    return data is Map<String, dynamic> ? data : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+class DeviceInfo {
+  /// Случайный идентификатор устройства (22 символа base64url, 128 бит).
+  static String newDeviceId() {
+    final r = Random.secure();
+    final bytes = List<int>.generate(16, (_) => r.nextInt(256));
+    return base64Url.encode(bytes).replaceAll('=', '');
   }
 
-  /// Определяет тип устройства
-  static String getDeviceType() {
-    if (kIsWeb) return 'web';
-    
-    // Для мобильных/десктопов определяем по платформе
-    switch (defaultTargetPlatform) {
-      case TargetPlatform.android:
-        return 'android';
-      case TargetPlatform.iOS:
-        return 'ios';
-      case TargetPlatform.windows:
-        return 'windows';
-      case TargetPlatform.macOS:
-        return 'macos';
-      case TargetPlatform.linux:
-        return 'linux';
-      default:
-        return 'unknown';
-    }
+  static String type() {
+    if (Platform.isAndroid) return 'android';
+    if (Platform.isIOS) return 'ios';
+    if (Platform.isWindows) return 'windows';
+    if (Platform.isMacOS) return 'macos';
+    return 'linux';
   }
 
-  /// Получает имя устройства
-  static Future<String> getDeviceName() async {
-    // Можно использовать device_info_plus для реального имени
-    // Пока возвращаем простое имя
-    final type = getDeviceType();
-    switch (type) {
+  static String name() {
+    try {
+      final host = Platform.localHostname.trim();
+      if (host.isNotEmpty && host != 'localhost') {
+        return host.length > 64 ? host.substring(0, 64) : host;
+      }
+    } catch (_) {}
+    switch (type()) {
       case 'android':
-        return 'Android Phone';
-      case 'ios':
-        return 'iPhone';
+        return 'Android';
       case 'windows':
         return 'Windows PC';
-      case 'macos':
-        return 'Mac';
-      case 'linux':
-        return 'Linux PC';
       default:
-        return 'Unknown Device';
+        return type();
     }
   }
 }

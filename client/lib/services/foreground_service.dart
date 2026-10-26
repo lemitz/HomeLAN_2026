@@ -1,6 +1,8 @@
+import 'package:flutter/foundation.dart';
 import 'dart:io';
 import 'dart:isolate';
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
+import '../l10n/strings.dart';
 
 class ForegroundService {
   static final ForegroundService _instance = ForegroundService._internal();
@@ -18,7 +20,7 @@ class ForegroundService {
       androidNotificationOptions: AndroidNotificationOptions(
         channelId: 'homelan_foreground',
         channelName: 'HomeLAN Service',
-        channelDescription: 'Поддержание связи с сервером',
+        channelDescription: S.current.fgChannelDesc,
         channelImportance: NotificationChannelImportance.LOW,
         priority: NotificationPriority.LOW,
         iconData: const NotificationIconData(
@@ -51,12 +53,12 @@ class ForegroundService {
 
     await FlutterForegroundTask.startService(
       notificationTitle: 'HomeLAN',
-      notificationText: 'Подключено к серверу',
+      notificationText: S.current.fgText,
       callback: _startCallback,
     );
 
     _isRunning = true;
-    print('✅ Foreground service started');
+    debugPrint('✅ Foreground service started');
   }
 
   /// Остановка сервиса
@@ -65,7 +67,7 @@ class ForegroundService {
 
     await FlutterForegroundTask.stopService();
     _isRunning = false;
-    print('🛑 Foreground service stopped');
+    debugPrint('🛑 Foreground service stopped');
   }
 
   /// Обновление уведомления
@@ -90,7 +92,7 @@ void _startCallback() {
 class _ForegroundTaskHandler extends TaskHandler {
   @override
   void onStart(DateTime timestamp, SendPort? sendPort) {
-    print('🚀 Foreground task started');
+    debugPrint('🚀 Foreground task started');
   }
 
   @override
@@ -100,6 +102,6 @@ class _ForegroundTaskHandler extends TaskHandler {
 
   @override
   void onDestroy(DateTime timestamp, SendPort? sendPort) {
-    print('💀 Foreground task destroyed');
+    debugPrint('💀 Foreground task destroyed');
   }
 }

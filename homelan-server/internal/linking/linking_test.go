@@ -6,54 +6,63 @@ import (
 	"time"
 )
 
-func TestLinkingService(t *testing.T) {
+func TestCodeFormat(t *testing.T) {
+	for i := 0; i < 200; i++ {
+		c := generateCode()
+		if len(c) != 11 || c[5] != '-' {
+			t.Fatalf("bad code format: %q", c)
+		}
+		for _, r := range strings.ReplaceAll(c, "-", "") {
+			if !strings.ContainsRune(alphabet, r) {
+				t.Fatalf("unexpected char %q in %q", r, c)
+			}
+		}
+	}
+}
+
+func TestConsumeIsBoundToDeviceAndSingleUse(t *testing.T) {
 	ls := NewLinkingService()
+	defer ls.Close()
 
-	// 1. Test CreateLink and GetLink success
-	link := ls.CreateLink(123)
-	if link == nil {
-		t.Fatal("expected link to be created")
-	}
-	if link.UserID != 123 {
-		t.Errorf("expected userID 123, got %d", link.UserID)
-	}
+	l := ls.CreateLink(1, "dev-new", "Phone", "android")
 
-	code := link.Code
-	if len(code) != 9 || !strings.Contains(code, "-") {
-		t.Errorf("expected code in XXXX-XXXX format, got %s", code)
+	// Чужое устройство — код сгорает.
+	if ls.Consume(l.Code, "dev-attacker") != nil {
+		t.Fatal("link must be bound to device id")
+	}
+	if ls.Consume(l.Code, "dev-new") != nil {
+		t.Fatal("code must be single-use even after mismatch")
 	}
 
-	// 2. Test GetLink normalisation (case insensitive, dash insensitive)
-	retrieved := ls.GetLink(strings.ToLower(code))
-	if retrieved == nil {
-		t.Fatal("expected to retrieve link with lowercase code")
+	l2 := ls.CreateLink(1, "dev-new", "Phone", "android")
+	lower := strings.ToLower(strings.ReplaceAll(l2.Code, "-", ""))
+	got := ls.Consume(" "+lower+" ", "dev-new")
+	if got == nil || got.UserID != 1 || got.DeviceName != "Phone" {
+		t.Fatalf("expected successful consume with normalized code, got %+v", got)
 	}
-	if retrieved.UserID != 123 {
-		t.Errorf("expected userID 123, got %d", retrieved.UserID)
+	if ls.Consume(l2.Code, "dev-new") != nil {
+		t.Fatal("code reused")
 	}
+}
 
-	// 3. Test One-Time Use (cannot retrieve again)
-	secondRetrieve := ls.GetLink(code)
-	if secondRetrieve != nil {
-		t.Error("expected link to be deleted after first retrieve (one-time use)")
+func TestNewLinkInvalidatesPrevious(t *testing.T) {
+	ls := NewLinkingService()
+	defer ls.Close()
+	first := ls.CreateLink(7, "a", "A", "windows")
+	ls.CreateLink(7, "b", "B", "windows")
+	if ls.Consume(first.Code, "a") != nil {
+		t.Fatal("old code should be invalidated")
 	}
+}
 
-	// 4. Test code without dash
-	link2 := ls.CreateLink(456)
-	code2 := strings.ReplaceAll(link2.Code, "-", "")
-	retrieved2 := ls.GetLink(code2)
-	if retrieved2 == nil {
-		t.Fatal("expected to retrieve link with code without dash")
-	}
-	if retrieved2.UserID != 456 {
-		t.Errorf("expected userID 456, got %d", retrieved2.UserID)
-	}
-
-	// 5. Test Expiration
-	link3 := ls.CreateLink(789)
-	link3.ExpiresAt = time.Now().Add(-1 * time.Second) // manually expire it
-	expired := ls.GetLink(link3.Code)
-	if expired != nil {
-		t.Error("expected link to be expired and nil")
+func TestExpiredLink(t *testing.T) {
+	ls := NewLinkingService()
+	defer ls.Close()
+	l := ls.CreateLink(1, "d", "D", "android")
+	ls.mu.Lock()
+	l.ExpiresAt = time.Now().Add(-time.Second)
+	ls.mu.Unlock()
+	if ls.Consume(l.Code, "d") != nil {
+		t.Fatal("expired link accepted")
 	}
 }

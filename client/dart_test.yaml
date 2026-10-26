@@ -1,0 +1,3 @@
+tags:
+  e2e:
+    # Требует запущенный сервер, см. test/e2e_server_test.dart
