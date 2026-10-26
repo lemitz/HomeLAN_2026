@@ -173,6 +173,21 @@ jobs:
           channel: stable
           cache: true
 
+      # Install the NDK this Flutter version asks for up front, with retries: letting Gradle
+      # download it on the fly occasionally ends with a broken archive.
+      - name: Install the Android NDK
+        run: |
+          ndk=$(grep -rhoE 'val ndkVersion: String = "[0-9.]+"' "$FLUTTER_ROOT/packages/flutter_tools/gradle" | grep -oE '[0-9.]+' | head -n 1)
+          echo "NDK $ndk"
+          sdkmanager=$(ls -d "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager | head -n 1)
+          for attempt in 1 2 3; do
+            if "$sdkmanager" --install "ndk;$ndk" > /dev/null; then exit 0; fi
+            echo "attempt $attempt failed, retrying"
+            rm -rf "$ANDROID_HOME/ndk/$ndk"
+            sleep 10
+          done
+          exit 1
+
       - run: flutter pub get
       - run: flutter analyze
       - run: flutter test
@@ -225,7 +240,9 @@ jobs:
 
   windows:
     needs: meta
-    runs-on: windows-latest
+    # Visual Studio 2022: VS 2026 (windows-latest) removed <experimental/coroutine>, which the
+    # local_auth_windows plugin still uses.
+    runs-on: windows-2022
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v7
