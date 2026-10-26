@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:mobile_scanner/mobile_scanner.dart';
 
+import '../l10n/strings.dart';
 import '../services/biometric_service.dart';
 
 /// Камера доступна только на мобильных платформах.
@@ -47,7 +48,7 @@ class _QrScanPageState extends State<QrScanPage> {
     if (_lastReject == null || now.difference(_lastReject!).inSeconds >= 3) {
       _lastReject = now;
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Это не тот QR-код'), duration: Duration(seconds: 2)),
+        SnackBar(content: Text(S.of(context).wrongQr), duration: const Duration(seconds: 2)),
       );
     }
   }
@@ -55,24 +56,22 @@ class _QrScanPageState extends State<QrScanPage> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('Сканирование')),
-      body: Stack(
-        children: [
-          MobileScanner(onDetect: _onDetect),
-          Positioned(
-            top: 24,
-            left: 24,
-            right: 24,
-            child: Container(
-              padding: const EdgeInsets.all(16),
-              decoration:
-                  BoxDecoration(color: Colors.black.withValues(alpha: 0.7), borderRadius: BorderRadius.circular(12)),
-              child: Text(widget.hint,
-                  textAlign: TextAlign.center, style: const TextStyle(color: Colors.white, fontSize: 16)),
+      backgroundColor: Colors.black,
+      appBar: AppBar(backgroundColor: Colors.black, title: Text(widget.hint, style: const TextStyle(fontSize: 16))),
+      body: Stack(children: [
+        MobileScanner(onDetect: _onDetect),
+        // Рамка прицела.
+        Center(
+          child: Container(
+            width: 250,
+            height: 250,
+            decoration: BoxDecoration(
+              border: Border.all(color: Colors.white70, width: 3),
+              borderRadius: BorderRadius.circular(24),
             ),
           ),
-        ],
-      ),
+        ),
+      ]),
     );
   }
 }

@@ -13,9 +13,10 @@ import '../models/models.dart';
 
 class DatabaseService {
   static const _version = 4;
-  Database? _db;
+  Future<Database>? _db;
 
-  Future<Database> get database async => _db ??= await _open();
+  // Кешируется сам Future: параллельные первые обращения не открывают БД дважды.
+  Future<Database> get database => _db ??= _open();
 
   Future<Database> _open() async {
     if (Platform.isWindows || Platform.isLinux) {

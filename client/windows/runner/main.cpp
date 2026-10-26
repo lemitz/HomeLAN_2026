@@ -2,11 +2,19 @@
 #include <flutter/flutter_view_controller.h>
 #include <windows.h>
 #include <dwmapi.h>
+#include <timeapi.h>
 
 #include "flutter_window.h"
 #include "utils.h"
 
 #pragma comment(lib, "dwmapi.lib")
+#pragma comment(lib, "winmm.lib")
+
+// Ноутбуки с двумя видеокартами: просим дискретную (NVIDIA Optimus / AMD).
+extern "C" {
+__declspec(dllexport) DWORD NvOptimusEnablement = 0x00000001;
+__declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
+}
 
 int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
                       _In_ wchar_t *command_line, _In_ int show_command) {
@@ -22,6 +30,19 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
     ::CloseHandle(mutex);
     return EXIT_SUCCESS;
   }
+
+  // Точность системного таймера 1 мс: без неё планировщик кадров движка
+  // просыпается с шагом ~15,6 мс и на 120/144 Гц кадры идут неровно.
+  // С Windows 10 2004 настройка действует только на этот процесс.
+  ::timeBeginPeriod(1);
+
+  // Windows 11 может включать «эко-режим» (EcoQoS) для фоновых окон —
+  // это даёт рывки при возврате к окну. Отключаем троттлинг для процесса.
+  PROCESS_POWER_THROTTLING_STATE throttling{};
+  throttling.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+  throttling.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+  throttling.StateMask = 0;
+  ::SetProcessInformation(::GetCurrentProcess(), ProcessPowerThrottling, &throttling, sizeof(throttling));
 
   if (!::AttachConsole(ATTACH_PARENT_PROCESS) && ::IsDebuggerPresent()) {
     CreateAndAttachConsole();
@@ -62,6 +83,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
   }
 
   ::CoUninitialize();
+  ::timeEndPeriod(1);
   if (mutex) ::CloseHandle(mutex);
   return EXIT_SUCCESS;
 }

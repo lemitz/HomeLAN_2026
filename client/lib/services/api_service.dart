@@ -6,6 +6,7 @@ import 'dart:typed_data';
 
 import 'package:http/http.dart' as http;
 
+import '../l10n/strings.dart';
 import 'time_service.dart';
 
 /// Ошибка, которую вернул сервер.
@@ -18,25 +19,8 @@ class ApiException implements Exception {
 
   bool get isUnauthorized => statusCode == 401;
 
-  /// Человекочитаемое описание для UI.
-  String get userMessage => _messages[code] ?? message;
-
-  static const _messages = {
-    'invalid_credentials': 'Неверный логин или пароль',
-    'rate_limited': 'Слишком много попыток. Подождите и попробуйте снова',
-    'device_not_linked': 'Это устройство не привязано к аккаунту. Привяжите его с уже подключённого устройства',
-    'device_revoked': 'Это устройство отозвано',
-    'user_limit': 'Достигнут лимит пользователей на сервере',
-    'username_taken': 'Такой логин уже занят',
-    'weak_password': 'Пароль должен быть не короче 8 символов',
-    'invalid_username': 'Логин: 3–32 символа, буквы, цифры, «_», «.», «-»',
-    'device_limit': 'Достигнут лимит устройств. Отзовите старое устройство',
-    'invalid_link_code': 'Код привязки неверный или устарел',
-    'file_too_large': 'Файл слишком большой для сервера',
-    'quota_exceeded': 'Хранилище файлов на сервере заполнено',
-    'disk_full': 'На сервере закончилось место',
-    'unauthorized': 'Сессия недействительна, войдите снова',
-  };
+  /// Человекочитаемое описание для UI (на языке интерфейса).
+  String get userMessage => S.current.apiError(code) ?? message;
 
   @override
   String toString() => userMessage;
@@ -47,7 +31,7 @@ class NetworkException implements Exception {
   final Object cause;
   NetworkException(this.cause);
   @override
-  String toString() => 'Сервер недоступен';
+  String toString() => S.current.serverUnavailable;
 }
 
 class ApiService {
@@ -98,7 +82,7 @@ class ApiService {
     throw ApiException(
       status,
       data['error'] as String? ?? 'http_$status',
-      data['message'] as String? ?? 'Ошибка сервера ($status)',
+      data['message'] as String? ?? S.current.serverError(status),
     );
   }
 

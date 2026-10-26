@@ -1,7 +1,10 @@
 // lib/screens/register_screen.dart
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
+
+import '../l10n/strings.dart';
 import '../providers/providers.dart';
+import '../widgets/ui.dart';
 
 class RegisterScreen extends StatefulWidget {
   const RegisterScreen({super.key});
@@ -11,213 +14,89 @@ class RegisterScreen extends StatefulWidget {
 }
 
 class _RegisterScreenState extends State<RegisterScreen> {
-  final _usernameController = TextEditingController();
-  final _passwordController = TextEditingController();
-  final _confirmPasswordController = TextEditingController();
-  bool _obscurePassword = true;
+  final _username = TextEditingController();
+  final _password = TextEditingController();
+  final _confirm = TextEditingController();
+  bool _obscure = true;
 
   @override
   void dispose() {
-    _usernameController.dispose();
-    _passwordController.dispose();
-    _confirmPasswordController.dispose();
+    _username.dispose();
+    _password.dispose();
+    _confirm.dispose();
     super.dispose();
   }
 
   Future<void> _register() async {
-    final username = _usernameController.text.trim();
-    final password = _passwordController.text;
-    final confirmPassword = _confirmPasswordController.text;
-
-    if (username.isEmpty || password.isEmpty) {
-      _showError('Заполните все поля');
+    final s = S.of(context);
+    final username = _username.text.trim();
+    final password = _password.text;
+    final String? problem = username.isEmpty || password.isEmpty
+        ? s.fillAllFields
+        : username.length < 3
+            ? s.usernameTooShort
+            : password.length < 8
+                ? s.passwordTooShort
+                : password != _confirm.text
+                    ? s.passwordsDontMatch
+                    : null;
+    if (problem != null) {
+      showSnack(context, problem, error: true);
       return;
     }
-
-    if (username.length < 3) {
-      _showError('Логин минимум 3 символа');
-      return;
-    }
-
-    if (password.length < 8) {
-      _showError('Пароль минимум 8 символов');
-      return;
-    }
-
-    if (password != confirmPassword) {
-      _showError('Пароли не совпадают');
-      return;
-    }
-
     final auth = context.read<AuthProvider>();
-    final success = await auth.register(username, password);
-
-    if (success && mounted) {
-      // Возвращаемся на AppStartup — он сам решит куда направить
-      Navigator.of(context).popUntil((route) => route.isFirst);
-    } else if (mounted && auth.error != null) {
-      _showError(auth.error!);
+    final ok = await auth.register(username, password);
+    if (!mounted) return;
+    if (ok) {
+      Navigator.of(context).popUntil((r) => r.isFirst);
+    } else if (auth.error != null) {
+      showSnack(context, auth.error!, error: true);
     }
-  }
-
-  void _showError(String message) {
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(message),
-        backgroundColor: Colors.red[700],
-      ),
-    );
   }
 
   @override
   Widget build(BuildContext context) {
-    final auth = context.watch<AuthProvider>();
+    final s = S.of(context);
+    final busy = context.select<AuthProvider, bool>((a) => a.isBusy);
 
     return Scaffold(
-      backgroundColor: Colors.grey[900],
-      appBar: AppBar(
-        backgroundColor: Colors.transparent,
-        elevation: 0,
-        leading: IconButton(
-          icon: const Icon(Icons.arrow_back, color: Colors.white),
-          onPressed: () => Navigator.pop(context),
-        ),
-      ),
+      appBar: AppBar(title: Text(s.signUp)),
       body: SafeArea(
-        child: Center(
-          child: SingleChildScrollView(
-            padding: const EdgeInsets.all(24),
-            child: Column(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                Icon(
-                  Icons.person_add_outlined,
-                  size: 80,
-                  color: Colors.blue[400],
-                ),
-                const SizedBox(height: 24),
-                const Text(
-                  'Регистрация',
-                  style: TextStyle(
-                    fontSize: 28,
-                    fontWeight: FontWeight.bold,
-                    color: Colors.white,
-                  ),
-                ),
-                const SizedBox(height: 8),
-                Text(
-                  'Создайте аккаунт',
-                  style: TextStyle(
-                    fontSize: 16,
-                    color: Colors.grey[400],
-                  ),
-                ),
-                const SizedBox(height: 48),
+        child: NarrowBody(
+          child: FadeSlideIn(
+            child: AutofillGroup(
+              child: Column(children: [
                 TextField(
-                  controller: _usernameController,
-                  style: const TextStyle(color: Colors.white),
-                  decoration: InputDecoration(
-                    labelText: 'Логин',
-                    labelStyle: TextStyle(color: Colors.grey[400]),
-                    prefixIcon: Icon(Icons.person, color: Colors.grey[400]),
-                    filled: true,
-                    fillColor: Colors.grey[850],
-                    border: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(12),
-                      borderSide: BorderSide.none,
-                    ),
-                    focusedBorder: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(12),
-                      borderSide: BorderSide(color: Colors.blue[400]!),
-                    ),
-                  ),
+                  controller: _username,
+                  autofillHints: const [AutofillHints.newUsername],
+                  textInputAction: TextInputAction.next,
+                  decoration: InputDecoration(hintText: s.username, prefixIcon: const Icon(Icons.person_outline)),
                 ),
-                const SizedBox(height: 16),
+                const SizedBox(height: 12),
                 TextField(
-                  controller: _passwordController,
-                  obscureText: _obscurePassword,
-                  style: const TextStyle(color: Colors.white),
+                  controller: _password,
+                  obscureText: _obscure,
+                  autofillHints: const [AutofillHints.newPassword],
+                  textInputAction: TextInputAction.next,
                   decoration: InputDecoration(
-                    labelText: 'Пароль',
-                    labelStyle: TextStyle(color: Colors.grey[400]),
-                    prefixIcon: Icon(Icons.lock, color: Colors.grey[400]),
+                    hintText: s.password,
+                    prefixIcon: const Icon(Icons.lock_outline),
                     suffixIcon: IconButton(
-                      icon: Icon(
-                        _obscurePassword ? Icons.visibility : Icons.visibility_off,
-                        color: Colors.grey[400],
-                      ),
-                      onPressed: () {
-                        setState(() {
-                          _obscurePassword = !_obscurePassword;
-                        });
-                      },
-                    ),
-                    filled: true,
-                    fillColor: Colors.grey[850],
-                    border: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(12),
-                      borderSide: BorderSide.none,
-                    ),
-                    focusedBorder: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(12),
-                      borderSide: BorderSide(color: Colors.blue[400]!),
+                      icon: Icon(_obscure ? Icons.visibility_outlined : Icons.visibility_off_outlined),
+                      onPressed: () => setState(() => _obscure = !_obscure),
                     ),
                   ),
                 ),
-                const SizedBox(height: 16),
+                const SizedBox(height: 12),
                 TextField(
-                  controller: _confirmPasswordController,
-                  obscureText: _obscurePassword,
-                  style: const TextStyle(color: Colors.white),
-                  decoration: InputDecoration(
-                    labelText: 'Подтвердите пароль',
-                    labelStyle: TextStyle(color: Colors.grey[400]),
-                    prefixIcon: Icon(Icons.lock_outline, color: Colors.grey[400]),
-                    filled: true,
-                    fillColor: Colors.grey[850],
-                    border: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(12),
-                      borderSide: BorderSide.none,
-                    ),
-                    focusedBorder: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(12),
-                      borderSide: BorderSide(color: Colors.blue[400]!),
-                    ),
-                  ),
+                  controller: _confirm,
+                  obscureText: _obscure,
                   onSubmitted: (_) => _register(),
+                  decoration: InputDecoration(hintText: s.repeatPassword, prefixIcon: const Icon(Icons.lock_outline)),
                 ),
-                const SizedBox(height: 24),
-                SizedBox(
-                  width: double.infinity,
-                  height: 50,
-                  child: ElevatedButton(
-                    onPressed: auth.isBusy ? null : _register,
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: Colors.blue[600],
-                      shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(12),
-                      ),
-                    ),
-                    child: auth.isBusy
-                        ? const SizedBox(
-                            width: 24,
-                            height: 24,
-                            child: CircularProgressIndicator(
-                              color: Colors.white,
-                              strokeWidth: 2,
-                            ),
-                          )
-                        : const Text(
-                            'Зарегистрироваться',
-                            style: TextStyle(
-                              fontSize: 16,
-                              fontWeight: FontWeight.bold,
-                              color: Colors.white,
-                            ),
-                          ),
-                  ),
-                ),
-              ],
+                const SizedBox(height: 20),
+                PrimaryButton(label: s.createAccount, loading: busy, onPressed: _register),
+              ]),
             ),
           ),
         ),

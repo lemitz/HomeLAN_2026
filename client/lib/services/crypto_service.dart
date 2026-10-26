@@ -14,6 +14,7 @@
 //   блокирует отправку до явного подтверждения пользователем.
 import 'dart:convert';
 import 'dart:typed_data';
+import '../l10n/strings.dart';
 
 import 'package:cryptography/cryptography.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
@@ -96,10 +97,10 @@ class CryptoService {
   /// Импортирует identity-ключ (при привязке устройства). Если передан
   /// [expectedPublic], ключ проверяется на соответствие серверному.
   Future<void> importIdentity(Uint8List privateKey, {Uint8List? expectedPublic}) async {
-    if (privateKey.length != 32) throw CryptoException('Неверная длина ключа');
+    if (privateKey.length != 32) throw CryptoException(S.current.badKeyLength);
     final pub = await publicFromPrivate(privateKey);
     if (expectedPublic != null && !_equal(pub, expectedPublic)) {
-      throw CryptoException('Полученный ключ не совпадает с ключом аккаунта');
+      throw CryptoException(S.current.linkKeyMismatch);
     }
     await _setIdentity(privateKey);
     await _persistIdentity(privateKey);
@@ -107,14 +108,14 @@ class CryptoService {
 
   Future<Uint8List> identityPublicKey() async {
     if (_identityPub == null && !await loadIdentity()) {
-      throw CryptoException('Нет ключа шифрования на этом устройстве');
+      throw CryptoException(S.current.noLocalKey);
     }
     return _identityPub!;
   }
 
   /// Приватный ключ — только для передачи на новое устройство через LinkCrypto.
   Future<Uint8List> exportIdentityPrivate() async {
-    if (!await loadIdentity()) throw CryptoException('Нет ключа шифрования');
+    if (!await loadIdentity()) throw CryptoException(S.current.noLocalKey);
     return Uint8List.fromList(await _identity!.extractPrivateKeyBytes());
   }
 
@@ -242,13 +243,11 @@ class CryptoService {
   // ============ MESSAGES ============
 
   Future<SecretKey> _sharedKey(int myId, int peerId) async {
-    if (!await loadIdentity()) throw CryptoException('Нет ключа шифрования на этом устройстве');
+    if (!await loadIdentity()) throw CryptoException(S.current.noLocalKey);
     final status = peerStatus(peerId);
     final peer = _peerKeys[peerId];
     if (peer == null || status == PeerKeyStatus.mismatch) {
-      throw CryptoException(status == PeerKeyStatus.mismatch
-          ? 'Ключ собеседника изменился — сверьте отпечаток'
-          : 'Нет ключа собеседника');
+      throw CryptoException(status == PeerKeyStatus.mismatch ? S.current.peerKeyChanged : S.current.noPeerKey);
     }
     final cacheKey = '$myId:$peerId:${base64Encode(peer)}';
     final cached = _sharedKeys[cacheKey];
@@ -303,10 +302,10 @@ class CryptoService {
     required String clientId,
   }) async {
     if (blob.length < 1 + 24 + 16 || blob[0] != kCryptoVersion) {
-      throw CryptoException('Неподдерживаемый формат сообщения');
+      throw CryptoException(S.current.unsupportedFormat);
     }
     final validPair = (senderId == myId && recipientId == peerId) || (senderId == peerId && recipientId == myId);
-    if (!validPair) throw CryptoException('Чужое сообщение');
+    if (!validPair) throw CryptoException(S.current.foreignMessage);
     final key = await _sharedKey(myId, peerId);
     final box = SecretBox(
       blob.sublist(25, blob.length - 16),
@@ -317,7 +316,7 @@ class CryptoService {
       final clear = await _aead.decrypt(box, secretKey: key, aad: _aad(senderId, recipientId, contentType, clientId));
       return Uint8List.fromList(clear);
     } on SecretBoxAuthenticationError {
-      throw CryptoException('Сообщение повреждено или подделано');
+      throw CryptoException(S.current.tampered);
     }
   }
 
@@ -419,14 +418,14 @@ class LinkCrypto {
     required String deviceId,
     required String code,
   }) async {
-    if (ciphertext.length != 24 + 32 + 16) throw CryptoException('Повреждённые данные привязки');
+    if (ciphertext.length != 24 + 32 + 16) throw CryptoException(S.current.linkDataCorrupt);
     final key = await _key(ephemeralPrivate, oldDevicePublic, deviceId);
     final box = SecretBox(ciphertext.sublist(24, ciphertext.length - 16),
         nonce: ciphertext.sublist(0, 24), mac: Mac(ciphertext.sublist(ciphertext.length - 16)));
     try {
       return Uint8List.fromList(await _aead.decrypt(box, secretKey: key, aad: _aad(deviceId, code)));
     } on SecretBoxAuthenticationError {
-      throw CryptoException('Код предназначен для другого устройства или повреждён');
+      throw CryptoException(S.current.linkWrongDevice);
     }
   }
 

@@ -1,44 +1,36 @@
 // lib/widgets/message_bubble.dart
+//
+// Пузырь сообщения. Для плавной прокрутки:
+// * подписка только на своё содержимое и цвета (context.select), а не на весь чат;
+// * RepaintBoundary — перерисовка одного пузыря не трогает соседей;
+// * MediaQuery.sizeOf — клавиатура не перестраивает все пузыри;
+// * обычный Text вместо SelectableText (копирование — через меню).
 import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:open_filex/open_filex.dart';
 import 'package:provider/provider.dart';
 
+import '../l10n/strings.dart';
 import '../models/models.dart';
 import '../providers/providers.dart';
+import '../theme.dart';
 
 /// Расширения, которые при открытии могут выполнить код.
 const _dangerousExtensions = {
-  'exe',
-  'bat',
-  'cmd',
-  'com',
-  'msi',
-  'ps1',
-  'vbs',
-  'js',
-  'jse',
-  'wsf',
-  'scr',
-  'lnk',
-  'hta',
-  'reg',
-  'jar',
-  'apk',
-  'sh',
-  'pif',
-  'cpl',
-  'msc',
-  'dll',
+  'exe', 'bat', 'cmd', 'com', 'msi', 'ps1', 'vbs', 'js', 'jse', 'wsf', 'scr', //
+  'lnk', 'hta', 'reg', 'jar', 'apk', 'sh', 'pif', 'cpl', 'msc', 'dll',
 };
 
 class MessageBubble extends StatefulWidget {
   final Message message;
   final bool isMe;
+
+  /// Последнее сообщение в серии подряд от одного отправителя — с «хвостиком».
+  final bool tail;
   final VoidCallback? onLongPress;
 
-  const MessageBubble({super.key, required this.message, required this.isMe, this.onLongPress});
+  const MessageBubble({super.key, required this.message, required this.isMe, this.tail = true, this.onLongPress});
 
   @override
   State<MessageBubble> createState() => _MessageBubbleState();
@@ -69,8 +61,7 @@ class _MessageBubbleState extends State<MessageBubble> {
       return path;
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text('Не удалось загрузить файл: $e'), backgroundColor: Colors.red[700]));
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(S.of(context).downloadFailed)));
       }
       return null;
     } finally {
@@ -79,17 +70,17 @@ class _MessageBubbleState extends State<MessageBubble> {
   }
 
   Future<void> _open(FileMeta meta) async {
+    final s = S.of(context);
     final ext = meta.name.contains('.') ? meta.name.split('.').last.toLowerCase() : '';
     if (_dangerousExtensions.contains(ext)) {
       final ok = await showDialog<bool>(
         context: context,
         builder: (ctx) => AlertDialog(
-          title: const Text('Открыть исполняемый файл?'),
-          content: Text('«${meta.name}» может запустить программу на этом устройстве. '
-              'Открывайте, только если уверены в источнике.'),
+          title: Text(s.openExecTitle),
+          content: Text(s.openExecBody(meta.name)),
           actions: [
-            TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Отмена')),
-            TextButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Открыть')),
+            TextButton(onPressed: () => Navigator.pop(ctx, false), child: Text(s.cancel)),
+            TextButton(onPressed: () => Navigator.pop(ctx, true), child: Text(s.open)),
           ],
         ),
       );
@@ -99,42 +90,51 @@ class _MessageBubbleState extends State<MessageBubble> {
     if (path == null) return;
     final result = await OpenFilex.open(path);
     if (result.type != ResultType.done && mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Нет приложения для открытия: ${meta.name}')));
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(s.noAppToOpen)));
     }
   }
 
   @override
   Widget build(BuildContext context) {
-    final chat = context.watch<ChatProvider>();
-    final d = chat.decryptedOf(m);
-    final color = Color(widget.isMe ? chat.myBubbleColor : chat.otherBubbleColor);
+    final d = context.select<ChatProvider, DecryptedContent?>((c) => c.decryptedOf(m));
+    final colorValue = context.select<ChatProvider, int>((c) => widget.isMe ? c.myBubbleColor : c.otherBubbleColor);
+    final maxWidth = MediaQuery.sizeOf(context).width * (MediaQuery.sizeOf(context).width > 700 ? 0.55 : 0.78);
+    final isMe = widget.isMe;
+    const r = Radius.circular(18);
+    const small = Radius.circular(6);
 
-    return Align(
-      alignment: widget.isMe ? Alignment.centerRight : Alignment.centerLeft,
-      child: GestureDetector(
-        onLongPress: widget.onLongPress,
-        onSecondaryTap: widget.onLongPress,
-        child: Container(
-          margin: EdgeInsets.only(left: widget.isMe ? 64 : 8, right: widget.isMe ? 8 : 64, top: 3, bottom: 3),
-          constraints: BoxConstraints(maxWidth: MediaQuery.of(context).size.width * 0.75),
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-          decoration: BoxDecoration(
-            color: color,
-            borderRadius: BorderRadius.only(
-              topLeft: const Radius.circular(16),
-              topRight: const Radius.circular(16),
-              bottomLeft: Radius.circular(widget.isMe ? 16 : 4),
-              bottomRight: Radius.circular(widget.isMe ? 4 : 16),
+    return RepaintBoundary(
+      child: Align(
+        alignment: isMe ? Alignment.centerRight : Alignment.centerLeft,
+        child: GestureDetector(
+          onLongPress: widget.onLongPress,
+          onSecondaryTap: widget.onLongPress,
+          child: AnimatedContainer(
+            duration: kMedium,
+            margin:
+                EdgeInsets.only(left: isMe ? 56 : 10, right: isMe ? 10 : 56, top: 1.5, bottom: widget.tail ? 6 : 1.5),
+            constraints: BoxConstraints(maxWidth: maxWidth),
+            padding: EdgeInsets.fromLTRB(m.isFile ? 6 : 12, m.isFile ? 6 : 8, m.isFile ? 6 : 12, 6),
+            decoration: BoxDecoration(
+              color: Color(colorValue),
+              borderRadius: BorderRadius.only(
+                topLeft: r,
+                topRight: r,
+                bottomLeft: isMe || !widget.tail ? r : small,
+                bottomRight: !isMe || !widget.tail ? r : small,
+              ),
             ),
-          ),
-          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            _content(d),
-            const SizedBox(height: 4),
-            Row(mainAxisSize: MainAxisSize.min, children: [
-              Text(_time(m.createdAt), style: TextStyle(color: Colors.white.withValues(alpha: 0.7), fontSize: 11)),
-              if (widget.isMe) ...[const SizedBox(width: 4), _status()],
+            child: Column(crossAxisAlignment: CrossAxisAlignment.end, mainAxisSize: MainAxisSize.min, children: [
+              _content(d),
+              Padding(
+                padding: EdgeInsets.only(top: 3, right: m.isFile ? 6 : 0),
+                child: Row(mainAxisSize: MainAxisSize.min, children: [
+                  Text(_time(m.createdAt), style: TextStyle(color: Colors.white.withValues(alpha: 0.6), fontSize: 11)),
+                  if (isMe) ...[const SizedBox(width: 4), _status()],
+                ]),
+              ),
             ]),
-          ]),
+          ),
         ),
       ),
     );
@@ -142,68 +142,118 @@ class _MessageBubbleState extends State<MessageBubble> {
 
   Widget _content(DecryptedContent? d) {
     if (d == null) {
-      return Text('Расшифровка...',
-          style: TextStyle(color: Colors.white.withValues(alpha: 0.7), fontStyle: FontStyle.italic));
+      return SizedBox(
+        width: 60,
+        height: 18,
+        child: Align(
+          alignment: Alignment.centerLeft,
+          child: Container(
+            width: 48,
+            height: 8,
+            decoration: BoxDecoration(color: Colors.white12, borderRadius: BorderRadius.circular(4)),
+          ),
+        ),
+      );
     }
     if (d.isError) {
       return Row(mainAxisSize: MainAxisSize.min, children: [
-        Icon(Icons.lock_outline, size: 14, color: Colors.red[300]),
+        const Icon(Icons.lock_outline, size: 14, color: Color(0xFFFFA198)),
         const SizedBox(width: 4),
-        Flexible(child: Text(d.error!, style: TextStyle(color: Colors.red[300], fontStyle: FontStyle.italic))),
+        Flexible(child: Text(d.error!, style: const TextStyle(color: Color(0xFFFFA198), fontStyle: FontStyle.italic))),
       ]);
     }
     if (d.file != null) return m.isImage ? _image(d.file!) : _file(d.file!);
-    return SelectableText(d.text ?? '', style: const TextStyle(color: Colors.white, fontSize: 16));
+    return Align(
+      alignment: Alignment.centerLeft,
+      widthFactor: 1,
+      child: Text(d.text ?? '', style: const TextStyle(color: Colors.white, fontSize: 15.5, height: 1.3)),
+    );
   }
 
   Widget _image(FileMeta meta) {
     final canPreview = meta.size <= _previewLimit;
+    final dpr = MediaQuery.devicePixelRatioOf(context);
     if (_localPath != null && canPreview) {
       return GestureDetector(
         onTap: () => Navigator.push(
           context,
-          MaterialPageRoute(builder: (_) => _ImageViewer(path: _localPath!, meta: meta, onOpen: () => _open(meta))),
+          PageRouteBuilder(
+            opaque: false,
+            transitionDuration: kMedium,
+            reverseTransitionDuration: kFast,
+            pageBuilder: (_, __, ___) =>
+                _ImageViewer(path: _localPath!, meta: meta, heroTag: 'img:${m.key}', onOpen: () => _open(meta)),
+            transitionsBuilder: (_, a, __, child) => FadeTransition(opacity: a, child: child),
+          ),
         ),
-        child: ClipRRect(
-          borderRadius: BorderRadius.circular(8),
-          child: Image.file(File(_localPath!),
-              width: 220,
+        child: Hero(
+          tag: 'img:${m.key}',
+          child: ClipRRect(
+            borderRadius: BorderRadius.circular(14),
+            child: Image.file(
+              File(_localPath!),
+              width: 240,
               fit: BoxFit.cover,
-              cacheWidth: 660,
-              errorBuilder: (_, __, ___) => _filePlaceholder(meta, Icons.broken_image)),
+              cacheWidth: (240 * dpr).round(),
+              frameBuilder: (_, child, frame, sync) =>
+                  sync ? child : AnimatedOpacity(opacity: frame == null ? 0 : 1, duration: kMedium, child: child),
+              errorBuilder: (_, __, ___) => _placeholder(meta, Icons.broken_image_outlined),
+            ),
+          ),
         ),
       );
     }
     return GestureDetector(
       onTap: canPreview ? _ensureDownloaded : () => _open(meta),
-      child: _filePlaceholder(meta, Icons.image),
+      child: _placeholder(meta, Icons.download_rounded),
     );
   }
 
-  Widget _filePlaceholder(FileMeta meta, IconData icon) => Container(
-        width: 220,
-        height: 140,
-        decoration: BoxDecoration(color: Colors.black26, borderRadius: BorderRadius.circular(8)),
+  Widget _placeholder(FileMeta meta, IconData icon) => Container(
+        width: 240,
+        height: 150,
+        decoration: BoxDecoration(color: Colors.black26, borderRadius: BorderRadius.circular(14)),
         child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
-          if (_downloading)
-            CircularProgressIndicator(value: _progress > 0 ? _progress : null)
-          else
-            Icon(icon, size: 40, color: Colors.white70),
+          AnimatedSwitcher(
+            duration: kFast,
+            child: _downloading
+                ? SizedBox(
+                    width: 40,
+                    height: 40,
+                    child: CircularProgressIndicator(value: _progress > 0 ? _progress : null, strokeWidth: 3))
+                : Container(
+                    width: 48,
+                    height: 48,
+                    decoration: const BoxDecoration(color: Colors.black38, shape: BoxShape.circle),
+                    child: Icon(icon, color: Colors.white),
+                  ),
+          ),
           const SizedBox(height: 8),
-          Text(_downloading ? 'Загрузка...' : 'Нажмите, чтобы загрузить',
-              style: const TextStyle(color: Colors.white70, fontSize: 12)),
-          Text(_size(meta.size), style: const TextStyle(color: Colors.white54, fontSize: 11)),
+          Text(_size(meta.size), style: const TextStyle(color: Colors.white60, fontSize: 12)),
         ]),
       );
 
   Widget _file(FileMeta meta) {
-    return GestureDetector(
+    return InkWell(
+      borderRadius: BorderRadius.circular(12),
       onTap: () => _open(meta),
-      child: Container(
-        padding: const EdgeInsets.all(10),
-        decoration: BoxDecoration(color: Colors.black26, borderRadius: BorderRadius.circular(8)),
+      child: Padding(
+        padding: const EdgeInsets.all(6),
         child: Row(mainAxisSize: MainAxisSize.min, children: [
-          const Icon(Icons.insert_drive_file, color: Colors.white, size: 32),
+          Container(
+            width: 44,
+            height: 44,
+            decoration: const BoxDecoration(color: Colors.black26, shape: BoxShape.circle),
+            child: AnimatedSwitcher(
+              duration: kFast,
+              child: _downloading
+                  ? Padding(
+                      padding: const EdgeInsets.all(10),
+                      child: CircularProgressIndicator(value: _progress > 0 ? _progress : null, strokeWidth: 2.5))
+                  : Icon(_localPath != null ? Icons.insert_drive_file_outlined : Icons.download_rounded,
+                      color: Colors.white),
+            ),
+          ),
           const SizedBox(width: 10),
           Flexible(
             child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
@@ -211,16 +261,10 @@ class _MessageBubbleState extends State<MessageBubble> {
                   style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w500),
                   maxLines: 2,
                   overflow: TextOverflow.ellipsis),
+              const SizedBox(height: 2),
               Text(_size(meta.size), style: const TextStyle(color: Colors.white60, fontSize: 12)),
             ]),
           ),
-          const SizedBox(width: 8),
-          _downloading
-              ? SizedBox(
-                  width: 22,
-                  height: 22,
-                  child: CircularProgressIndicator(value: _progress > 0 ? _progress : null, strokeWidth: 2))
-              : const Icon(Icons.download, color: Colors.white70),
         ]),
       ),
     );
@@ -228,20 +272,20 @@ class _MessageBubbleState extends State<MessageBubble> {
 
   Widget _status() {
     final white = Colors.white.withValues(alpha: 0.7);
-    switch (m.deliveryStatus) {
-      case DeliveryStatus.pending:
-        return Icon(Icons.access_time, size: 14, color: white);
-      case DeliveryStatus.failed:
-        return Tooltip(
-            message: m.failReason ?? 'Не отправлено',
-            child: Icon(Icons.error_outline, size: 14, color: Colors.red[200]));
-      case DeliveryStatus.sent:
-        return Icon(Icons.check, size: 14, color: white);
-      case DeliveryStatus.delivered:
-        return Icon(Icons.done_all, size: 14, color: white);
-      case DeliveryStatus.read:
-        return const Icon(Icons.done_all, size: 14, color: Colors.lightBlueAccent);
-    }
+    final Widget icon = switch (m.deliveryStatus) {
+      DeliveryStatus.pending => Icon(Icons.schedule, size: 14, color: white),
+      DeliveryStatus.failed => Tooltip(
+          message: m.failReason ?? S.of(context).notSentShort,
+          child: const Icon(Icons.error_outline, size: 14, color: Color(0xFFFFA198))),
+      DeliveryStatus.sent => Icon(Icons.check, size: 14, color: white),
+      DeliveryStatus.delivered => Icon(Icons.done_all, size: 14, color: white),
+      DeliveryStatus.read => const Icon(Icons.done_all, size: 14, color: Color(0xFF8CE0FF)),
+    };
+    return AnimatedSwitcher(
+      duration: kFast,
+      transitionBuilder: (child, a) => ScaleTransition(scale: a, child: child),
+      child: KeyedSubtree(key: ValueKey(m.deliveryStatus), child: icon),
+    );
   }
 
   static String _size(int b) {
@@ -260,9 +304,10 @@ class _MessageBubbleState extends State<MessageBubble> {
 class _ImageViewer extends StatelessWidget {
   final String path;
   final FileMeta meta;
+  final String heroTag;
   final VoidCallback onOpen;
 
-  const _ImageViewer({required this.path, required this.meta, required this.onOpen});
+  const _ImageViewer({required this.path, required this.meta, required this.heroTag, required this.onOpen});
 
   @override
   Widget build(BuildContext context) {
@@ -270,11 +315,18 @@ class _ImageViewer extends StatelessWidget {
       backgroundColor: Colors.black,
       appBar: AppBar(
         backgroundColor: Colors.black,
-        title: Text(meta.name, overflow: TextOverflow.ellipsis),
-        actions: [IconButton(icon: const Icon(Icons.open_in_new), tooltip: 'Открыть в приложении', onPressed: onOpen)],
+        title: Text(meta.name, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 15)),
+        actions: [IconButton(icon: const Icon(Icons.open_in_new), tooltip: S.of(context).open, onPressed: onOpen)],
       ),
-      body: Center(
-        child: InteractiveViewer(minScale: 0.5, maxScale: 5, child: Image.file(File(path), fit: BoxFit.contain)),
+      body: GestureDetector(
+        onTap: () => Navigator.pop(context),
+        child: Center(
+          child: InteractiveViewer(
+            minScale: 0.5,
+            maxScale: 5,
+            child: Hero(tag: heroTag, child: Image.file(File(path), fit: BoxFit.contain)),
+          ),
+        ),
       ),
     );
   }

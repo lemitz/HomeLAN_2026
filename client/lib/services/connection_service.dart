@@ -3,6 +3,7 @@
 import 'dart:async';
 import 'dart:io';
 import 'package:flutter/foundation.dart';
+import '../l10n/strings.dart';
 
 enum ServerConnectionState {
   unknown,
@@ -47,7 +48,7 @@ class ConnectionService with ChangeNotifier {
 
     final alive = await _checkHealth();
     if (!alive) {
-      _disconnectReason = 'Сервер не отвечает';
+      _disconnectReason = S.current.serverNotResponding;
       _setState(ServerConnectionState.disconnected);
       return false;
     }
@@ -91,7 +92,7 @@ class ConnectionService with ChangeNotifier {
     } else {
       _failedChecks++;
       if (_failedChecks >= maxFailedChecks || _state != ServerConnectionState.connected) {
-        _disconnectReason = 'Сервер не отвечает';
+        _disconnectReason = S.current.serverNotResponding;
         _setState(ServerConnectionState.disconnected);
       }
     }

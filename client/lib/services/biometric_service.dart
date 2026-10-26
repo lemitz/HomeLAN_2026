@@ -1,6 +1,7 @@
 // lib/services/biometric_service.dart
 import 'package:flutter/foundation.dart';
 import 'package:local_auth/local_auth.dart';
+import '../l10n/strings.dart';
 
 enum UnlockResult {
   /// Пользователь подтвердил личность.
@@ -43,7 +44,7 @@ class BiometricService {
     try {
       if (!await _auth.isDeviceSupported()) return UnlockResult.notAvailable;
       final ok = await _auth.authenticate(
-        localizedReason: 'Подтвердите личность для входа в HomeLAN',
+        localizedReason: S.current.unlockReason,
         options: const AuthenticationOptions(
           stickyAuth: true,
           biometricOnly: false, // PIN/пароль устройства как запасной вариант

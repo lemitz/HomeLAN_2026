@@ -2,8 +2,11 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
+import '../l10n/strings.dart';
 import '../providers/auth_provider.dart';
 import '../services/crypto_service.dart';
+import '../theme.dart';
+import '../widgets/ui.dart';
 
 /// Сверка отпечатка ключей с собеседником (защита от подмены ключей в сети).
 class SafetyNumberScreen extends StatefulWidget {
@@ -26,63 +29,79 @@ class _SafetyNumberScreenState extends State<SafetyNumberScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final s = S.of(context);
     final auth = context.watch<AuthProvider>();
     final status = auth.partnerKeyStatus;
-    final name = auth.partnerUsername ?? 'собеседником';
+    final name = auth.partnerUsername ?? s.contact;
     final groups = _number?.split(' ') ?? [];
 
     return Scaffold(
-      appBar: AppBar(title: const Text('Отпечаток ключей')),
-      body: SingleChildScrollView(
-        padding: const EdgeInsets.all(24),
-        child: Column(
-          children: [
-            if (status == PeerKeyStatus.mismatch)
-              Container(
+      appBar: AppBar(title: Text(s.safetyNumber)),
+      body: NarrowBody(
+        child: Column(children: [
+          if (status == PeerKeyStatus.mismatch)
+            FadeSlideIn(
+              child: Container(
+                width: double.infinity,
                 padding: const EdgeInsets.all(16),
-                margin: const EdgeInsets.only(bottom: 24),
-                decoration:
-                    BoxDecoration(color: Colors.red.withValues(alpha: 0.15), borderRadius: BorderRadius.circular(12)),
-                child: Text(
-                  'Сервер прислал НОВЫЙ ключ для $name. Это бывает, если собеседник пересоздал аккаунт, '
-                  'но может означать подмену. Отправка сообщений заблокирована, пока вы не сверите номер ниже '
-                  'лично или по телефону.',
-                  style: TextStyle(color: Colors.red[200]),
-                ),
+                margin: const EdgeInsets.only(bottom: 20),
+                decoration: BoxDecoration(
+                    color: AppColors.danger.withValues(alpha: 0.12), borderRadius: BorderRadius.circular(14)),
+                child: Text(s.safetyMismatch(name), style: const TextStyle(color: AppColors.danger)),
               ),
-            Text('Сравните эти цифры с $name — у вас обоих они должны совпадать.',
-                textAlign: TextAlign.center, style: TextStyle(color: Colors.grey[400])),
-            const SizedBox(height: 24),
-            if (_number == null)
-              const CircularProgressIndicator()
-            else
-              Wrap(
-                alignment: WrapAlignment.center,
-                spacing: 16,
-                runSpacing: 12,
-                children: [
-                  for (final g in groups)
-                    Text(g, style: const TextStyle(fontSize: 24, fontFamily: 'monospace', letterSpacing: 2)),
-                ],
-              ),
-            const SizedBox(height: 32),
-            if (status == PeerKeyStatus.verified)
-              Row(mainAxisAlignment: MainAxisAlignment.center, children: [
-                Icon(Icons.verified, color: Colors.green[400]),
-                const SizedBox(width: 8),
-                Text('Проверено', style: TextStyle(color: Colors.green[400])),
-              ])
-            else if (_number != null)
-              ElevatedButton.icon(
-                onPressed: () async {
-                  await auth.markPartnerVerified();
-                  if (context.mounted) Navigator.pop(context);
-                },
-                icon: const Icon(Icons.verified_user),
-                label: Text(status == PeerKeyStatus.mismatch ? 'Совпадает — принять новый ключ' : 'Совпадает'),
-              ),
-          ],
-        ),
+            ),
+          Text(s.safetyCompare(name), textAlign: TextAlign.center, style: const TextStyle(color: AppColors.muted)),
+          const SizedBox(height: 20),
+          Panel(
+            child: AnimatedSwitcher(
+              duration: kMedium,
+              child: _number == null
+                  ? const SizedBox(height: 120, child: Center(child: CircularProgressIndicator()))
+                  : GridView.count(
+                      key: const ValueKey('n'),
+                      crossAxisCount: 3,
+                      shrinkWrap: true,
+                      physics: const NeverScrollableScrollPhysics(),
+                      childAspectRatio: 2.4,
+                      children: [
+                        for (var i = 0; i < groups.length; i++)
+                          FadeSlideIn(
+                            delay: Duration(milliseconds: 25 * i),
+                            child: Center(
+                              child: Text(groups[i],
+                                  style: const TextStyle(
+                                      fontSize: 22,
+                                      fontFamily: 'monospace',
+                                      letterSpacing: 2,
+                                      fontFeatures: [FontFeature.tabularFigures()])),
+                            ),
+                          ),
+                      ],
+                    ),
+            ),
+          ),
+          const SizedBox(height: 24),
+          AnimatedSwitcher(
+            duration: kMedium,
+            child: status == PeerKeyStatus.verified
+                ? Row(key: const ValueKey('ok'), mainAxisAlignment: MainAxisAlignment.center, children: [
+                    const Icon(Icons.verified, color: AppColors.success),
+                    const SizedBox(width: 8),
+                    Text(s.verified, style: const TextStyle(color: AppColors.success, fontSize: 16)),
+                  ])
+                : _number == null
+                    ? const SizedBox.shrink()
+                    : PrimaryButton(
+                        key: const ValueKey('btn'),
+                        icon: Icons.verified_user_outlined,
+                        label: status == PeerKeyStatus.mismatch ? s.acceptNewKey : s.matches,
+                        onPressed: () async {
+                          await auth.markPartnerVerified();
+                          if (context.mounted) Navigator.pop(context);
+                        },
+                      ),
+          ),
+        ]),
       ),
     );
   }

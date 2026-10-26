@@ -5,13 +5,16 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/scheduler.dart';
 import 'package:mime/mime.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:uuid/uuid.dart';
 
+import '../l10n/strings.dart';
 import '../models/models.dart';
 import '../services/services.dart';
+import '../theme.dart';
 import 'auth_provider.dart';
 
 /// Переписка с собеседником.
@@ -61,8 +64,8 @@ class ChatProvider with ChangeNotifier {
   bool _chatVisible = false;
   DateTime? _peerTypingAt;
 
-  int _myBubbleColor = Colors.blue.toARGB32();
-  int _otherBubbleColor = Colors.grey[800]!.toARGB32();
+  int _myBubbleColor = AppColors.myBubble.toARGB32();
+  int _otherBubbleColor = AppColors.otherBubble.toARGB32();
   bool _notificationsEnabled = true;
   Map<String, dynamic>? _contact;
 
@@ -78,6 +81,39 @@ class ChatProvider with ChangeNotifier {
   bool get isPeerTyping => _peerTypingAt != null && DateTime.now().difference(_peerTypingAt!).inSeconds < 4;
 
   DecryptedContent? decryptedOf(Message m) => _decrypted[m.key];
+
+  // ============ ПРОИЗВОДИТЕЛЬНОСТЬ ============
+
+  /// Растёт при каждом изменении списка сообщений. Список в UI подписан
+  /// только на него, поэтому расшифровка, «печатает» и т.п. его не перестраивают.
+  int _revision = 0;
+  int get revision => _revision;
+
+  bool _notifyScheduled = false;
+  bool _disposed = false;
+
+  /// Уведомления объединяются: не чаще одного раза за кадр. При синхронизации
+  /// сотен сообщений это превращает сотни перестроек UI в одну.
+  @override
+  void notifyListeners() {
+    if (_notifyScheduled || _disposed) return;
+    _notifyScheduled = true;
+    SchedulerBinding.instance.scheduleFrameCallback((_) {
+      _notifyScheduled = false;
+      if (!_disposed) super.notifyListeners();
+    });
+  }
+
+  void _touch() {
+    _revision++;
+    notifyListeners();
+  }
+
+  /// Новые сообщения внизу чата, которые нужно показать с анимацией.
+  final Set<String> _appear = {};
+
+  /// true один раз для только что пришедшего/отправленного сообщения.
+  bool takeAppear(String key) => _appear.remove(key);
 
   int get unreadCount => _messages.where((m) => m.senderId == _peerId && m.readAt == null && !m.isDeleted).length;
 
@@ -117,7 +153,7 @@ class ChatProvider with ChangeNotifier {
     _hasMoreHistory = true;
     _syncing = false;
     _contact = null;
-    notifyListeners();
+    _touch();
   }
 
   Future<void> _loadFromCache() async {
@@ -125,7 +161,7 @@ class ChatProvider with ChangeNotifier {
     if (_myId == null) return;
     _messages = cached;
     if (_peerId != null) _contact = await _db.getContact(_peerId!);
-    notifyListeners();
+    _touch();
     _decryptAll();
   }
 
@@ -148,11 +184,11 @@ class ChatProvider with ChangeNotifier {
   Future<void> _sync() async {
     if (_syncing) return;
     _syncing = true;
-    notifyListeners();
+    _touch();
     final cursor = await _db.getSyncCursor();
     if (!_ws.send('sync', {'since': cursor, 'limit': 200})) {
       _syncing = false;
-      notifyListeners();
+      _touch();
     }
   }
 
@@ -169,7 +205,7 @@ class ChatProvider with ChangeNotifier {
       return;
     }
     _syncing = false;
-    notifyListeners();
+    _touch();
     await _flushOutbox();
     _ackUndelivered();
     if (_chatVisible) markRead();
@@ -184,16 +220,18 @@ class ChatProvider with ChangeNotifier {
     if (stored.isDeleted) {
       if (!isNew) _messages.removeAt(idx);
       _decrypted.remove(stored.key);
-      notifyListeners();
+      _touch();
       return;
     }
 
     if (isNew) {
-      _messages.insert(_insertIndex(stored), stored);
+      final at = _insertIndex(stored);
+      if (at == 0 && _messages.isNotEmpty) _appear.add(stored.key);
+      _messages.insert(at, stored);
     } else {
       _messages[idx] = stored;
     }
-    notifyListeners();
+    _touch();
     await _decrypt(stored);
 
     final incomingFromPeer = stored.senderId != _myId;
@@ -243,7 +281,7 @@ class ChatProvider with ChangeNotifier {
   Future<void> loadOlder() async {
     if (_loadingHistory || !_hasMoreHistory || _messages.isEmpty) return;
     _loadingHistory = true;
-    notifyListeners();
+    _touch();
     final oldest = _messages.last;
     final cached = await _db.recentMessages(limit: 100, beforeCreatedAt: oldest.createdAt);
     final known = _messages.map((m) => m.key).toSet();
@@ -251,7 +289,7 @@ class ChatProvider with ChangeNotifier {
     if (fresh.isNotEmpty) {
       _messages.addAll(fresh);
       _loadingHistory = false;
-      notifyListeners();
+      _touch();
       _decryptAll();
       return;
     }
@@ -261,7 +299,7 @@ class ChatProvider with ChangeNotifier {
         .fold<int?>(null, (a, b) => a == null || b < a ? b : a);
     if (oldestSeq == null || !_ws.send('history', {'before_seq': oldestSeq, 'limit': 50})) {
       _loadingHistory = false;
-      notifyListeners();
+      _touch();
     }
   }
 
@@ -276,7 +314,7 @@ class ChatProvider with ChangeNotifier {
     }
     _hasMoreHistory = data['has_more'] == true;
     _loadingHistory = false;
-    notifyListeners();
+    _touch();
     _decryptAll();
   }
 
@@ -318,7 +356,7 @@ class ChatProvider with ChangeNotifier {
     final idx = _messages.indexWhere((m) => m.senderId == _myId && m.clientId == clientId);
     if (idx >= 0 && _messages[idx].localStatus != LocalStatus.sent) {
       _messages[idx] = _messages[idx].copyWith(localStatus: LocalStatus.sent);
-      notifyListeners();
+      _touch();
     }
   }
 
@@ -330,18 +368,18 @@ class ChatProvider with ChangeNotifier {
     final reason = data['message'] as String? ?? data['code'] as String?;
     _messages[idx] = m.copyWith(localStatus: LocalStatus.failed, failReason: reason);
     if (m.localId != null) await _db.setLocalStatus(m.localId!, LocalStatus.failed, reason: reason);
-    notifyListeners();
+    _touch();
   }
 
   // ============ ОТПРАВКА ============
 
   void _requireKey() {
-    if (_myId == null || _peerId == null) throw StateError('Собеседник ещё не подключён');
+    if (_myId == null || _peerId == null) throw StateError(S.current.noPartnerYet);
     final status = _crypto.peerStatus(_peerId!);
     if (status == PeerKeyStatus.mismatch) {
-      throw CryptoException('Ключ собеседника изменился. Сверьте отпечаток в настройках чата');
+      throw CryptoException(S.current.peerKeyChanged);
     }
-    if (status == PeerKeyStatus.unknown) throw CryptoException('Нет ключа собеседника');
+    if (status == PeerKeyStatus.unknown) throw CryptoException(S.current.noPeerKey);
   }
 
   Future<void> sendText(String text) async {
@@ -369,11 +407,12 @@ class ChatProvider with ChangeNotifier {
       localStatus: LocalStatus.pending,
     );
     msg = await _db.insertPending(msg);
+    _appear.add(msg.key);
     _messages.insert(0, msg);
     _decrypted[msg.key] = contentType == 'text'
         ? DecryptedContent.text(utf8.decode(plaintext))
         : DecryptedContent.file(FileMeta.fromJson(jsonDecode(utf8.decode(plaintext))));
-    notifyListeners();
+    _touch();
     _transmit(msg);
   }
 
@@ -403,7 +442,7 @@ class ChatProvider with ChangeNotifier {
     final idx = _messages.indexWhere((x) => x.key == m.key);
     final updated = m.copyWith(localStatus: LocalStatus.pending);
     if (idx >= 0) _messages[idx] = updated;
-    notifyListeners();
+    _touch();
     _transmit(updated);
   }
 
@@ -413,7 +452,7 @@ class ChatProvider with ChangeNotifier {
     await _db.deleteLocal(m.localId!);
     _messages.removeWhere((x) => x.key == m.key);
     _decrypted.remove(m.key);
-    notifyListeners();
+    _touch();
   }
 
   /// Шифрует файл потоком, загружает и отправляет сообщение с метаданными.
@@ -444,7 +483,7 @@ class ChatProvider with ChangeNotifier {
   /// Возвращает путь к расшифрованному файлу.
   Future<String> downloadFile(Message m, {void Function(double)? onProgress}) async {
     final meta = _decrypted[m.key]?.file;
-    if (meta == null || m.fileId == null) throw StateError('Нет данных файла');
+    if (meta == null || m.fileId == null) throw StateError(S.current.noFileData);
     final dir = await decryptedFilesDir();
     final out = p.join(dir.path, '${m.seqId ?? m.clientId}_${safeFileName(meta.name)}');
     if (await File(out).exists()) return out;
@@ -525,7 +564,7 @@ class ChatProvider with ChangeNotifier {
           ? DecryptedContent.file(FileMeta.fromJson(jsonDecode(text) as Map<String, dynamic>))
           : DecryptedContent.text(text);
     } catch (e) {
-      _decrypted[m.key] = DecryptedContent.error(e is CryptoException ? e.message : 'Не удалось расшифровать');
+      _decrypted[m.key] = DecryptedContent.error(e is CryptoException ? e.message : S.current.cantDecrypt);
     } finally {
       _decrypting.remove(m.key);
     }
@@ -535,11 +574,11 @@ class ChatProvider with ChangeNotifier {
   Future<void> _notify(Message m) async {
     if (!_notificationsEnabled || _peerId == null) return;
     final d = _decrypted[m.key];
-    final name = contactName(_auth?.partnerUsername ?? 'Собеседник');
+    final name = contactName(_auth?.partnerUsername ?? S.current.contact);
     await _notifications.showMessageNotification(
       senderId: m.senderId,
       senderName: name,
-      messageText: d?.text ?? 'Новое сообщение',
+      messageText: d?.text ?? S.current.newMessage,
       isImage: m.isImage,
       isFile: m.contentType == 'file',
     );
@@ -568,25 +607,25 @@ class ChatProvider with ChangeNotifier {
     if (my != null) _myBubbleColor = int.tryParse(my) ?? _myBubbleColor;
     if (other != null) _otherBubbleColor = int.tryParse(other) ?? _otherBubbleColor;
     _notificationsEnabled = notif != 'false';
-    notifyListeners();
+    _touch();
   }
 
   Future<void> setNotificationsEnabled(bool enabled) async {
     _notificationsEnabled = enabled;
     await _db.saveSetting('notifications_enabled', enabled.toString());
-    notifyListeners();
+    _touch();
   }
 
   Future<void> setMyBubbleColor(int color) async {
     _myBubbleColor = color;
     await _db.saveSetting('my_bubble_color', color.toString());
-    notifyListeners();
+    _touch();
   }
 
   Future<void> setOtherBubbleColor(int color) async {
     _otherBubbleColor = color;
     await _db.saveSetting('other_bubble_color', color.toString());
-    notifyListeners();
+    _touch();
   }
 
   String contactName(String fallback) {
@@ -594,17 +633,18 @@ class ChatProvider with ChangeNotifier {
     return custom != null && custom.isNotEmpty ? custom : fallback;
   }
 
-  int get contactAvatarColor => _contact?['custom_avatar_color'] as int? ?? Colors.blue.toARGB32();
+  int get contactAvatarColor => _contact?['custom_avatar_color'] as int? ?? AppColors.avatarPalette.first.toARGB32();
 
   Future<void> saveContact(String? name, int? color) async {
     if (_peerId == null) return;
     await _db.saveContact(_peerId!, name, color);
     _contact = {'custom_name': name, 'custom_avatar_color': color};
-    notifyListeners();
+    _touch();
   }
 
   @override
   void dispose() {
+    _disposed = true;
     _wsSub?.cancel();
     super.dispose();
   }

@@ -4,7 +4,10 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
+import '../l10n/strings.dart';
 import '../providers/auth_provider.dart';
+import '../theme.dart';
+import '../widgets/ui.dart';
 import 'settings_screen.dart';
 
 class WaitingForPartnerScreen extends StatefulWidget {
@@ -14,9 +17,11 @@ class WaitingForPartnerScreen extends StatefulWidget {
   State<WaitingForPartnerScreen> createState() => _WaitingForPartnerScreenState();
 }
 
-class _WaitingForPartnerScreenState extends State<WaitingForPartnerScreen> {
+class _WaitingForPartnerScreenState extends State<WaitingForPartnerScreen> with SingleTickerProviderStateMixin {
   Timer? _timer;
   bool _checking = false;
+  late final AnimationController _pulse = AnimationController(vsync: this, duration: const Duration(milliseconds: 1600))
+    ..repeat(reverse: true);
 
   @override
   void initState() {
@@ -27,6 +32,7 @@ class _WaitingForPartnerScreenState extends State<WaitingForPartnerScreen> {
   @override
   void dispose() {
     _timer?.cancel();
+    _pulse.dispose();
     super.dispose();
   }
 
@@ -42,36 +48,35 @@ class _WaitingForPartnerScreenState extends State<WaitingForPartnerScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final s = S.of(context);
     return Scaffold(
       appBar: AppBar(
-        title: const Text('HomeLAN'),
+        title: Text(s.appName),
         actions: [
           IconButton(
-            icon: const Icon(Icons.settings),
+            icon: const Icon(Icons.settings_outlined),
+            tooltip: s.settings,
             onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const SettingsScreen())),
           ),
         ],
       ),
       body: Center(
-        child: Padding(
-          padding: const EdgeInsets.all(32),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Icon(Icons.hourglass_empty, size: 80, color: Colors.blue[400]),
-              const SizedBox(height: 24),
-              const Text('Ожидание собеседника',
-                  style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold, color: Colors.white)),
-              const SizedBox(height: 16),
-              Text(
-                'Второй пользователь ещё не зарегистрирован.\n\nПопросите его установить приложение и создать аккаунт.',
-                style: TextStyle(fontSize: 16, color: Colors.grey[400]),
-                textAlign: TextAlign.center,
+        child: FadeSlideIn(
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
+            ScaleTransition(
+              scale: Tween(begin: 0.92, end: 1.0).animate(CurvedAnimation(parent: _pulse, curve: Curves.easeInOut)),
+              child: Container(
+                width: 96,
+                height: 96,
+                decoration: BoxDecoration(color: AppColors.accent.withValues(alpha: 0.12), shape: BoxShape.circle),
+                child: const Icon(Icons.person_add_alt_1_outlined, size: 44, color: AppColors.accent),
               ),
-              const SizedBox(height: 32),
-              const CircularProgressIndicator(),
-            ],
-          ),
+            ),
+            const SizedBox(height: 24),
+            Text(s.waitingTitle, style: const TextStyle(fontSize: 22, fontWeight: FontWeight.w600)),
+            const SizedBox(height: 8),
+            Text(s.waitingHint, textAlign: TextAlign.center, style: const TextStyle(color: AppColors.muted)),
+          ]),
         ),
       ),
     );

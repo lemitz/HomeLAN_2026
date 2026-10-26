@@ -1,5 +1,6 @@
 // lib/services/server_config.dart
 import 'package:shared_preferences/shared_preferences.dart';
+import '../l10n/strings.dart';
 
 import 'mdns_service.dart';
 
@@ -27,7 +28,7 @@ class ServerConfig {
     if (!url.startsWith('http://') && !url.startsWith('https://')) url = 'http://$url';
     url = url.replaceAll(RegExp(r'/+$'), '');
     final uri = Uri.parse(url);
-    if (uri.host.isEmpty) throw const FormatException('Неверный адрес');
+    if (uri.host.isEmpty) throw FormatException(S.current.invalidAddress);
     if (!uri.hasPort) url = '$url:8080';
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(_key, url);

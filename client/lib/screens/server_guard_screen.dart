@@ -2,7 +2,10 @@
 import 'package:flutter/material.dart';
 
 import '../services/connection_service.dart';
+import '../l10n/strings.dart';
+import '../theme.dart';
 import '../widgets/server_address.dart';
+import '../widgets/ui.dart';
 
 /// Windows: пока сервер недоступен, содержимое приложения скрыто
 /// (решение v0.9 — переписка на ПК видна только при связи с домашним сервером).
@@ -69,36 +72,42 @@ class _ServerGuardState extends State<ServerGuard> {
   }
 
   Widget _buildOverlay() {
+    final s = S.current;
     final down = _conn.isDisconnected;
-    return Material(
-      color: Colors.black,
-      child: Center(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(down ? Icons.cloud_off : Icons.cloud_sync, size: 80, color: down ? Colors.red[400] : Colors.blue[400]),
-            const SizedBox(height: 24),
-            const Text('HomeLAN', style: TextStyle(fontSize: 32, fontWeight: FontWeight.bold, color: Colors.white)),
+    return FadeSlideIn(
+      offsetY: 0,
+      child: Material(
+        color: AppColors.bg,
+        child: Center(
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
+            const AppLogo(size: 72),
+            const SizedBox(height: 28),
+            AnimatedSwitcher(
+              duration: kFast,
+              child: Text(
+                down ? s.serverUnavailable : s.connecting,
+                key: ValueKey(down),
+                style: TextStyle(fontSize: 16, color: down ? AppColors.danger : AppColors.muted),
+              ),
+            ),
+            const SizedBox(height: 28),
+            SizedBox(
+              height: 52,
+              child: AnimatedSwitcher(
+                duration: kFast,
+                child: !down || _retrying
+                    ? const SizedBox(width: 28, height: 28, child: CircularProgressIndicator(strokeWidth: 2.5))
+                    : FilledButton.icon(
+                        style: FilledButton.styleFrom(minimumSize: const Size(200, 48)),
+                        onPressed: _retry,
+                        icon: const Icon(Icons.refresh),
+                        label: Text(s.reconnect),
+                      ),
+              ),
+            ),
             const SizedBox(height: 16),
-            Text(down ? 'Сервер недоступен' : 'Подключение...',
-                style: TextStyle(fontSize: 16, color: down ? Colors.red[400] : Colors.blue[400])),
-            if (down && _conn.disconnectReason != null)
-              Padding(
-                padding: const EdgeInsets.only(top: 8),
-                child: Text(_conn.disconnectReason!, style: TextStyle(color: Colors.grey[500])),
-              ),
-            const SizedBox(height: 32),
-            if (!down || _retrying)
-              const CircularProgressIndicator()
-            else
-              ElevatedButton.icon(
-                onPressed: _retry,
-                icon: const Icon(Icons.refresh),
-                label: const Text('Переподключиться'),
-              ),
-            const SizedBox(height: 24),
             const ServerAddressField(),
-          ],
+          ]),
         ),
       ),
     );

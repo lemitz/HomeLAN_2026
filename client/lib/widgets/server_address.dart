@@ -2,7 +2,9 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
+import '../l10n/strings.dart';
 import '../services/services.dart';
+import '../theme.dart';
 
 /// Применяет новый адрес сервера ко всем сервисам.
 Future<String> applyServerUrl(BuildContext context, String input) async {
@@ -53,50 +55,52 @@ class _ServerAddressFieldState extends State<ServerAddressField> {
       });
       widget.onSaved?.call();
     } catch (_) {
-      setState(() => _error = 'Неверный адрес');
+      setState(() => _error = S.of(context).invalidAddress);
     }
   }
 
   @override
   Widget build(BuildContext context) {
     final current = context.read<ApiService>().baseUrl;
-    if (!_editing) {
-      return TextButton.icon(
-        onPressed: () => setState(() => _editing = true),
-        icon: Icon(Icons.dns, size: 16, color: Colors.grey[500]),
-        label: Text('Сервер: $current', style: TextStyle(color: Colors.grey[500], fontSize: 12)),
-      );
-    }
-    return SizedBox(
-      width: 360,
-      child: Row(
-        children: [
-          Expanded(
-            child: TextField(
-              controller: _controller,
-              autofocus: true,
-              style: const TextStyle(color: Colors.white, fontSize: 14),
-              decoration: InputDecoration(
-                isDense: true,
-                hintText: '192.168.1.10:8080',
-                errorText: _error,
-                filled: true,
-                fillColor: Colors.grey[850],
-                border: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: BorderSide.none),
-              ),
-              onSubmitted: (_) => _save(),
+    return AnimatedSwitcher(
+      duration: kFast,
+      child: !_editing
+          ? TextButton.icon(
+              key: const ValueKey('view'),
+              onPressed: () => setState(() => _editing = true),
+              icon: const Icon(Icons.dns_outlined, size: 16, color: AppColors.muted),
+              label: Text(current.replaceFirst(RegExp(r'^https?://'), ''),
+                  style: const TextStyle(color: AppColors.muted, fontSize: 13)),
+            )
+          : SizedBox(
+              key: const ValueKey('edit'),
+              width: 360,
+              child: Row(children: [
+                Expanded(
+                  child: TextField(
+                    controller: _controller,
+                    autofocus: true,
+                    style: const TextStyle(fontSize: 14),
+                    decoration: InputDecoration(
+                      isDense: true,
+                      hintText: '192.168.1.10:8080',
+                      errorText: _error,
+                      prefixIcon: const Icon(Icons.dns_outlined, size: 18),
+                    ),
+                    onSubmitted: (_) => _save(),
+                  ),
+                ),
+                IconButton(icon: const Icon(Icons.check, color: AppColors.success), onPressed: _save),
+                IconButton(
+                  icon: const Icon(Icons.close),
+                  onPressed: () => setState(() {
+                    _editing = false;
+                    _error = null;
+                    _controller.text = current;
+                  }),
+                ),
+              ]),
             ),
-          ),
-          IconButton(icon: const Icon(Icons.check, color: Colors.green), onPressed: _save),
-          IconButton(
-            icon: const Icon(Icons.close, color: Colors.grey),
-            onPressed: () => setState(() {
-              _editing = false;
-              _controller.text = current;
-            }),
-          ),
-        ],
-      ),
     );
   }
 }

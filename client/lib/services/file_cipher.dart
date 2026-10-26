@@ -100,10 +100,10 @@ class FileCipher {
           header[1] != _magic[1] ||
           header[2] != _magic[2] ||
           header[3] != _magic[3]) {
-        throw const FormatException('Неверный формат файла');
+        throw const FormatException('bad file header');
       }
       final size = ByteData.view(header.buffer).getUint32(4);
-      if (size == 0 || size > 16 * 1024 * 1024) throw const FormatException('Неверный размер блока');
+      if (size == 0 || size > 16 * 1024 * 1024) throw const FormatException('bad chunk size');
       final prefix = header.sublist(8, 24);
 
       var offset = _headerSize;
@@ -112,7 +112,7 @@ class FileCipher {
       while (offset < total) {
         final remaining = total - offset;
         final len = remaining < size + _macSize ? remaining : size + _macSize;
-        if (len < _macSize) throw const FormatException('Файл обрезан');
+        if (len < _macSize) throw const FormatException('truncated file');
         final block = await input.read(len);
         offset += len;
         final last = offset >= total;
@@ -123,7 +123,7 @@ class FileCipher {
         sawLast = last;
         index++;
       }
-      if (!sawLast) throw const FormatException('Файл обрезан');
+      if (!sawLast) throw const FormatException('truncated file');
       await output.flush();
       ok = true;
     } finally {

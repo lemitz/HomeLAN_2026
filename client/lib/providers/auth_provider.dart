@@ -1,5 +1,6 @@
 // lib/providers/auth_provider.dart
 import 'dart:convert';
+import '../l10n/strings.dart';
 
 import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -117,7 +118,7 @@ class AuthProvider with ChangeNotifier {
 
   Future<void> _onSessionRejected() async {
     if (!isLoggedIn) return;
-    await _endSession(notice: 'Сессия недействительна. Войдите снова');
+    await _endSession(notice: S.current.sessionInvalid);
   }
 
   // ============ REGISTER / LOGIN / LINK ============
@@ -142,8 +143,7 @@ class AuthProvider with ChangeNotifier {
 
   Future<bool> login(String username, String password) => _guard(() async {
         if (_deviceId == null || !await _crypto.loadIdentity()) {
-          throw const _UserError('На этом устройстве нет ключа шифрования. '
-              'Привяжите устройство с уже подключённого («Привязать к аккаунту»)');
+          throw _UserError(S.current.noIdentityOnDevice);
         }
         final data = await _api.login(username: username, password: password, deviceId: _deviceId!);
         await _applySession(data, saveToken: true);
@@ -158,7 +158,7 @@ class AuthProvider with ChangeNotifier {
       _guard(() async {
         final data = await _api.completeLinking(linkCode: linkCode, deviceId: deviceId);
         final user = UserInfo.fromJson(data['user']);
-        if (user == null) throw const _UserError('Некорректный ответ сервера');
+        if (user == null) throw _UserError(S.current.badServerResponse);
         final pub = await CryptoService.publicFromPrivate(identityPrivate);
         if (!CryptoService.equalBytes(pub, user.publicKey)) {
           // Ключ не совпал с ключом аккаунта — сессию на сервере сразу закрываем.
@@ -167,7 +167,7 @@ class AuthProvider with ChangeNotifier {
             await _api.revokeDevice(deviceId);
           } catch (_) {}
           _api.token = null;
-          throw const _UserError('Полученный ключ не совпадает с ключом аккаунта. Привязка отменена');
+          throw _UserError(S.current.linkKeyMismatch);
         }
         await _replaceIdentity(identityPrivate, pub);
         await _saveDeviceId(deviceId);
@@ -189,18 +189,17 @@ class AuthProvider with ChangeNotifier {
 
   Future<void> _applySession(Map<String, dynamic> data, {required bool saveToken}) async {
     final user = UserInfo.fromJson(data['user']);
-    if (user == null) throw const _UserError('Некорректный ответ сервера');
+    if (user == null) throw _UserError(S.current.badServerResponse);
 
     // Ключ аккаунта на сервере обязан совпадать с ключом устройства.
     final myPub = await _crypto.identityPublicKey();
     if (!CryptoService.equalBytes(myPub, user.publicKey)) {
-      throw const _UserError('Ключ шифрования устройства не совпадает с ключом аккаунта на сервере. '
-          'Возможна подмена сервера. Вход остановлен');
+      throw _UserError(S.current.accountKeyMismatch);
     }
 
     if (saveToken) {
       final token = data['token'] as String?;
-      if (token == null) throw const _UserError('Сервер не выдал токен');
+      if (token == null) throw _UserError(S.current.noToken);
       await _crypto.saveToken(token);
       _api.token = token;
     }
@@ -327,13 +326,13 @@ class AuthProvider with ChangeNotifier {
     } on ApiException catch (e) {
       _error = e.userMessage;
     } on NetworkException {
-      _error = 'Сервер недоступен. Проверьте подключение к домашней сети';
+      _error = S.current.networkError;
     } on _UserError catch (e) {
       _error = e.message;
     } on CryptoException catch (e) {
       _error = e.message;
     } catch (e) {
-      _error = 'Ошибка: $e';
+      _error = S.current.error(e);
     } finally {
       _isBusy = false;
       notifyListeners();

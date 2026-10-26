@@ -52,7 +52,13 @@ void main() {
 
     // Отправитель может прочитать своё сообщение (на другом своём устройстве).
     final own = await alice.decryptMessage(
-        blob: blob, myId: aliceId, peerId: bobId, senderId: aliceId, recipientId: bobId, contentType: 'text', clientId: 'c1');
+        blob: blob,
+        myId: aliceId,
+        peerId: bobId,
+        senderId: aliceId,
+        recipientId: bobId,
+        contentType: 'text',
+        clientId: 'c1');
     expect(utf8.decode(own), 'Привет');
   });
 
@@ -72,7 +78,8 @@ void main() {
     final broken = Uint8List.fromList(blob)..[30] ^= 1;
     await expectLater(() => bobReads(broken), throwsA(isA<CryptoException>()));
     // Не v2 / открытый текст.
-    await expectLater(() => bobReads(bytes('plain text message here, not encrypted!')), throwsA(isA<CryptoException>()));
+    await expectLater(
+        () => bobReads(bytes('plain text message here, not encrypted!')), throwsA(isA<CryptoException>()));
   });
 
   test('TOFU blocks a substituted peer key until accepted', () async {
@@ -112,13 +119,21 @@ void main() {
     test('identity transfer works only for the intended device', () async {
       final identity = await alice.exportIdentityPrivate();
       final newDevice = await EphemeralKey.generate();
-      final req = LinkRequest(deviceId: 'dev-new-1234567890', deviceName: 'PC', deviceType: 'windows', ephemeralPublic: newDevice.publicKey);
+      final req = LinkRequest(
+          deviceId: 'dev-new-1234567890',
+          deviceName: 'PC',
+          deviceType: 'windows',
+          ephemeralPublic: newDevice.publicKey);
       final parsedReq = LinkRequest.tryParse(req.encode())!;
       expect(parsedReq.deviceId, req.deviceId);
 
       final (ephPub, ct) = await LinkCrypto.seal(
-          identityPrivate: identity, newDevicePublic: parsedReq.ephemeralPublic, deviceId: parsedReq.deviceId, code: 'ABCDE-FGHJK');
-      final resp = LinkResponse.tryParse(LinkResponse(code: 'ABCDE-FGHJK', ephemeralPublic: ephPub, ciphertext: ct).encode())!;
+          identityPrivate: identity,
+          newDevicePublic: parsedReq.ephemeralPublic,
+          deviceId: parsedReq.deviceId,
+          code: 'ABCDE-FGHJK');
+      final resp =
+          LinkResponse.tryParse(LinkResponse(code: 'ABCDE-FGHJK', ephemeralPublic: ephPub, ciphertext: ct).encode())!;
 
       final opened = await LinkCrypto.open(
           ephemeralPrivate: newDevice.privateKey,
@@ -129,14 +144,16 @@ void main() {
       expect(opened, identity);
 
       final attacker = await EphemeralKey.generate();
-      await expectLater(() => LinkCrypto.open(
+      await expectLater(
+          () => LinkCrypto.open(
               ephemeralPrivate: attacker.privateKey,
               oldDevicePublic: resp.ephemeralPublic,
               ciphertext: resp.ciphertext,
               deviceId: req.deviceId,
               code: resp.code),
           throwsA(isA<CryptoException>()));
-      await expectLater(() => LinkCrypto.open(
+      await expectLater(
+          () => LinkCrypto.open(
               ephemeralPrivate: newDevice.privateKey,
               oldDevicePublic: resp.ephemeralPublic,
               ciphertext: resp.ciphertext,
@@ -147,7 +164,8 @@ void main() {
 
     test('text format tolerates whitespace and rejects garbage', () async {
       final k = await EphemeralKey.generate();
-      final text = LinkRequest(deviceId: 'd' * 22, deviceName: 'n', deviceType: 'android', ephemeralPublic: k.publicKey).encode();
+      final text = LinkRequest(deviceId: 'd' * 22, deviceName: 'n', deviceType: 'android', ephemeralPublic: k.publicKey)
+          .encode();
       final wrapped = '${text.substring(0, 20)}\n  ${text.substring(20)} ';
       expect(LinkRequest.tryParse(wrapped), isNotNull);
       expect(LinkRequest.tryParse('HL1:garbage'), isNull);

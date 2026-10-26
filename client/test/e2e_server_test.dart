@@ -186,7 +186,10 @@ void main() {
     // --- привязка нового устройства Алисы (2-QR) ---
     final newDevice = await EphemeralKey.generate();
     final req = LinkRequest(
-        deviceId: DeviceInfo.newDeviceId(), deviceName: 'Alice PC', deviceType: 'windows', ephemeralPublic: newDevice.publicKey);
+        deviceId: DeviceInfo.newDeviceId(),
+        deviceName: 'Alice PC',
+        deviceType: 'windows',
+        ephemeralPublic: newDevice.publicKey);
     final parsed = LinkRequest.tryParse(req.encode())!;
     final linkData = await alice.api
         .createLinkCode(deviceId: parsed.deviceId, deviceName: parsed.deviceName, deviceType: parsed.deviceType);
@@ -215,9 +218,8 @@ void main() {
     await pc.connect();
     pc.ws.send('sync', {'since': 0});
     final pcSync = await pc.waitFor('sync_response');
-    final first = Message.fromServer((pcSync['messages'] as List)
-        .cast<Map<String, dynamic>>()
-        .firstWhere((m) => m['client_id'] == clientId));
+    final first = Message.fromServer(
+        (pcSync['messages'] as List).cast<Map<String, dynamic>>().firstWhere((m) => m['client_id'] == clientId));
     final pcClear = await pc.crypto.decryptMessage(
         blob: first.encryptedContent,
         myId: pc.user.id,

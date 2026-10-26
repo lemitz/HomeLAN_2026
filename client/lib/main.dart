@@ -2,11 +2,15 @@
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:provider/provider.dart';
 
+import 'l10n/strings.dart';
 import 'providers/providers.dart';
 import 'screens/screens.dart';
 import 'services/services.dart';
+import 'theme.dart';
+import 'widgets/ui.dart';
 
 class _LanHttpOverrides extends HttpOverrides {
   @override
@@ -22,6 +26,9 @@ final bool isMobile = Platform.isAndroid || Platform.isIOS;
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   HttpOverrides.global = _LanHttpOverrides();
+
+  final locale = LocaleController();
+  await locale.load();
 
   // Расшифрованные файлы с прошлого запуска не храним.
   await ChatProvider.clearDecryptedFiles().catchError((_) {});
@@ -39,7 +46,7 @@ void main() async {
     await ForegroundService().init();
   }
 
-  runApp(HomeLanApp(api: api, ws: ws, db: db, crypto: crypto, notifications: notifications));
+  runApp(HomeLanApp(api: api, ws: ws, db: db, crypto: crypto, notifications: notifications, locale: locale));
 }
 
 class HomeLanApp extends StatelessWidget {
@@ -48,6 +55,7 @@ class HomeLanApp extends StatelessWidget {
   final DatabaseService db;
   final CryptoService crypto;
   final NotificationService notifications;
+  final LocaleController locale;
 
   const HomeLanApp({
     super.key,
@@ -56,7 +64,10 @@ class HomeLanApp extends StatelessWidget {
     required this.db,
     required this.crypto,
     required this.notifications,
+    required this.locale,
   });
+
+  static final _theme = buildTheme();
 
   @override
   Widget build(BuildContext context) {
@@ -65,6 +76,7 @@ class HomeLanApp extends StatelessWidget {
         Provider.value(value: api),
         Provider.value(value: db),
         Provider.value(value: crypto),
+        ChangeNotifierProvider.value(value: locale),
         ChangeNotifierProvider.value(value: ws),
         ChangeNotifierProvider.value(value: ConnectionService()),
         ChangeNotifierProvider(
@@ -75,46 +87,62 @@ class HomeLanApp extends StatelessWidget {
           update: (_, auth, chat) => chat!..attachAuth(auth),
         ),
       ],
-      child: MaterialApp(
-        title: 'HomeLAN',
-        debugShowCheckedModeBanner: false,
-        themeMode: ThemeMode.dark,
-        theme: ThemeData(
-          brightness: Brightness.dark,
-          colorSchemeSeed: Colors.blue,
-          scaffoldBackgroundColor: Colors.grey[900],
-          splashFactory: NoSplash.splashFactory,
-          visualDensity: VisualDensity.compact,
+      child: Consumer<LocaleController>(
+        builder: (context, lc, _) => MaterialApp(
+          onGenerateTitle: (ctx) => S.of(ctx).appName,
+          debugShowCheckedModeBanner: false,
+          themeMode: ThemeMode.dark,
+          theme: _theme,
+          darkTheme: _theme,
+          locale: lc.locale,
+          supportedLocales: S.supportedLocales,
+          localizationsDelegates: const [
+            S.delegate,
+            GlobalMaterialLocalizations.delegate,
+            GlobalWidgetsLocalizations.delegate,
+            GlobalCupertinoLocalizations.delegate,
+          ],
+          // Язык системы: русский, если он есть в списке языков, иначе английский.
+          localeListResolutionCallback: (locales, _) => S.resolve(locales),
+          // Блокировка и защита сервера — поверх навигатора: закрывают все
+          // экраны, но не уничтожают их состояние.
+          builder: (context, child) {
+            Widget app = child ?? const SizedBox.shrink();
+            if (isWindows) app = ServerGuard(child: app);
+            if (isMobile) app = LockGate(child: app);
+            return AppLifecycleHooks(child: app);
+          },
+          home: const RootScreen(),
         ),
-        // Блокировка и защита сервера — поверх навигатора: закрывают все
-        // экраны, но не уничтожают их состояние.
-        builder: (context, child) {
-          Widget app = child ?? const SizedBox.shrink();
-          if (isWindows) app = ServerGuard(child: app);
-          if (isMobile) app = LockGate(child: app);
-          return AppLifecycleHooks(child: app);
-        },
-        home: const RootScreen(),
       ),
     );
   }
 }
 
-/// Выбирает экран по состоянию авторизации.
+/// Выбирает экран по состоянию авторизации (с плавной сменой).
 class RootScreen extends StatelessWidget {
   const RootScreen({super.key});
 
   @override
   Widget build(BuildContext context) {
-    final auth = context.watch<AuthProvider>();
-    switch (auth.status) {
-      case AuthStatus.loading:
-        return const SplashScreen();
-      case AuthStatus.loggedOut:
-        return const LoginScreen();
-      case AuthStatus.loggedIn:
-        return auth.hasPartner ? const ChatScreen() : const WaitingForPartnerScreen();
-    }
+    final status = context.select<AuthProvider, AuthStatus>((a) => a.status);
+    final hasPartner = context.select<AuthProvider, bool>((a) => a.hasPartner);
+    final Widget screen = switch (status) {
+      AuthStatus.loading => const SplashScreen(key: ValueKey('splash')),
+      AuthStatus.loggedOut => const LoginScreen(key: ValueKey('login')),
+      AuthStatus.loggedIn =>
+        hasPartner ? const ChatScreen(key: ValueKey('chat')) : const WaitingForPartnerScreen(key: ValueKey('waiting')),
+    };
+    return AnimatedSwitcher(
+      duration: kMedium,
+      switchInCurve: Curves.easeOutCubic,
+      switchOutCurve: Curves.easeInCubic,
+      transitionBuilder: (child, anim) => FadeTransition(
+        opacity: anim,
+        child: ScaleTransition(scale: Tween(begin: 0.98, end: 1.0).animate(anim), child: child),
+      ),
+      child: screen,
+    );
   }
 }
 
@@ -157,19 +185,6 @@ class SplashScreen extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      body: Center(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(Icons.lock_outline, size: 80, color: Colors.blue[400]),
-            const SizedBox(height: 24),
-            const Text('HomeLAN', style: TextStyle(fontSize: 28, fontWeight: FontWeight.bold)),
-            const SizedBox(height: 24),
-            const CircularProgressIndicator(),
-          ],
-        ),
-      ),
-    );
+    return const Scaffold(body: Center(child: AppLogo(size: 72)));
   }
 }

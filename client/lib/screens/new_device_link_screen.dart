@@ -8,7 +8,10 @@ import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 import 'package:qr_flutter/qr_flutter.dart';
 
+import '../l10n/strings.dart';
 import '../providers/auth_provider.dart';
+import '../theme.dart';
+import '../widgets/ui.dart';
 import '../services/services.dart';
 import '../widgets/qr_scan_view.dart';
 
@@ -58,14 +61,14 @@ class _NewDeviceLinkScreenState extends State<NewDeviceLinkScreen> {
 
   Future<void> _scan() async {
     final value = await QrScanPage.open(context,
-        hint: 'Отсканируйте QR-код с основного устройства', accept: (v) => LinkResponse.tryParse(v) != null);
+        hint: S.of(context).scanFromMainDevice, accept: (v) => LinkResponse.tryParse(v) != null);
     if (value != null) await _complete(value);
   }
 
   Future<void> _complete(String input) async {
     final resp = LinkResponse.tryParse(input);
     if (resp == null) {
-      setState(() => _error = 'Это не ответ привязки. Скопируйте текст целиком (начинается с HL2:)');
+      setState(() => _error = S.of(context).notLinkResponse);
       return;
     }
     setState(() {
@@ -106,114 +109,101 @@ class _NewDeviceLinkScreenState extends State<NewDeviceLinkScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final s = S.of(context);
+    final Widget body = _request == null || _completing
+        ? Center(
+            key: const ValueKey('busy'),
+            child: Column(mainAxisSize: MainAxisSize.min, children: [
+              const CircularProgressIndicator(),
+              if (_completing) ...[
+                const SizedBox(height: 16),
+                Text(s.linking, style: const TextStyle(color: AppColors.muted)),
+              ],
+            ]),
+          )
+        : NarrowBody(
+            key: const ValueKey('form'),
+            maxWidth: 480,
+            child: Column(children: [
+              FadeSlideIn(child: _step1(s)),
+              const SizedBox(height: 16),
+              FadeSlideIn(delay: const Duration(milliseconds: 60), child: _step2(s)),
+            ]),
+          );
     return Scaffold(
-      appBar: AppBar(title: const Text('Привязать устройство')),
-      body: _request == null || _completing
-          ? Center(
-              child: Column(mainAxisSize: MainAxisSize.min, children: [
-                const CircularProgressIndicator(),
-                if (_completing) ...[
-                  const SizedBox(height: 16),
-                  Text('Привязка устройства...', style: TextStyle(color: Colors.grey[400])),
-                ],
-              ]),
-            )
-          : SingleChildScrollView(
-              padding: const EdgeInsets.all(24),
-              child: Center(
-                child: ConstrainedBox(
-                  constraints: const BoxConstraints(maxWidth: 480),
-                  child: Column(children: [_step1(), const SizedBox(height: 24), _step2()]),
-                ),
-              ),
-            ),
+      appBar: AppBar(title: Text(s.linkTitle)),
+      body: AnimatedSwitcher(duration: kMedium, child: body),
     );
   }
 
-  Widget _card({required List<Widget> children}) => Container(
-        width: double.infinity,
-        padding: const EdgeInsets.all(20),
-        decoration: BoxDecoration(color: Colors.grey[850], borderRadius: BorderRadius.circular(16)),
-        child: Column(children: children),
-      );
+  Widget _stepHeader(int n, String text) => Row(children: [
+        Container(
+          width: 26,
+          height: 26,
+          alignment: Alignment.center,
+          decoration: const BoxDecoration(color: AppColors.accent, shape: BoxShape.circle),
+          child: Text('$n', style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 13)),
+        ),
+        const SizedBox(width: 12),
+        Expanded(child: Text(text, style: const TextStyle(fontWeight: FontWeight.w500))),
+      ]);
 
-  Widget _step1() {
+  Widget _step1(S s) {
     final text = _request!.encode();
-    return _card(children: [
-      const Text('Шаг 1', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-      const SizedBox(height: 8),
-      Text(
-        'На основном устройстве откройте «Мои устройства» → «Добавить устройство» '
-        'и отсканируйте этот код (или вставьте его текст).',
-        textAlign: TextAlign.center,
-        style: TextStyle(color: Colors.grey[400]),
-      ),
-      const SizedBox(height: 16),
-      Container(
-        color: Colors.white,
-        padding: const EdgeInsets.all(12),
-        child: QrImageView(data: text, size: 220, backgroundColor: Colors.white),
-      ),
-      const SizedBox(height: 12),
-      TextButton.icon(
-        onPressed: () {
-          Clipboard.setData(ClipboardData(text: text));
-          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Скопировано')));
-        },
-        icon: const Icon(Icons.copy),
-        label: const Text('Нет камеры? Скопировать как текст'),
-      ),
-      const SizedBox(height: 8),
-      Text('Код сверки', style: TextStyle(color: Colors.grey[500], fontSize: 12)),
-      Text(_verification!, style: const TextStyle(fontSize: 28, letterSpacing: 4, fontWeight: FontWeight.bold)),
-      Text('Он должен совпасть с кодом на основном устройстве',
-          style: TextStyle(color: Colors.grey[500], fontSize: 12)),
-    ]);
+    return Panel(
+      child: Column(children: [
+        _stepHeader(1, s.linkStep1),
+        const SizedBox(height: 20),
+        Container(
+          padding: const EdgeInsets.all(12),
+          decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(16)),
+          child: QrImageView(data: text, size: 220, backgroundColor: Colors.white),
+        ),
+        const SizedBox(height: 8),
+        TextButton.icon(
+          onPressed: () {
+            Clipboard.setData(ClipboardData(text: text));
+            showSnack(context, s.copied);
+          },
+          icon: const Icon(Icons.copy_rounded, size: 18),
+          label: Text(s.copyAsText),
+        ),
+        const SizedBox(height: 8),
+        Text(s.verificationCode, style: const TextStyle(color: AppColors.muted, fontSize: 12)),
+        const SizedBox(height: 4),
+        Text(_verification!, style: const TextStyle(fontSize: 30, letterSpacing: 6, fontWeight: FontWeight.w700)),
+      ]),
+    );
   }
 
-  Widget _step2() {
-    return _card(children: [
-      const Text('Шаг 2', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-      const SizedBox(height: 8),
-      Text('Получите ответ с основного устройства.',
-          textAlign: TextAlign.center, style: TextStyle(color: Colors.grey[400])),
-      const SizedBox(height: 16),
-      if (canScanQr)
-        SizedBox(
-          width: double.infinity,
-          height: 48,
-          child: ElevatedButton.icon(
-            onPressed: _scan,
-            icon: const Icon(Icons.qr_code_scanner),
-            label: const Text('Сканировать ответ'),
-          ),
+  Widget _step2(S s) {
+    return Panel(
+      child: Column(children: [
+        _stepHeader(2, s.linkStep2),
+        const SizedBox(height: 16),
+        if (canScanQr) ...[
+          PrimaryButton(icon: Icons.qr_code_scanner, label: s.scan, onPressed: _scan),
+          const SizedBox(height: 12),
+        ],
+        TextField(
+          controller: _responseController,
+          minLines: 2,
+          maxLines: 4,
+          style: const TextStyle(fontSize: 12, fontFamily: 'monospace'),
+          decoration: InputDecoration(hintText: s.pasteResponse),
         ),
-      const SizedBox(height: 12),
-      TextField(
-        controller: _responseController,
-        minLines: 2,
-        maxLines: 4,
-        style: const TextStyle(fontSize: 12, fontFamily: 'monospace'),
-        decoration: InputDecoration(
-          hintText: 'Или вставьте текст ответа (HL2:...)',
-          filled: true,
-          fillColor: Colors.grey[800],
-          border: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide.none),
-        ),
-      ),
-      const SizedBox(height: 12),
-      SizedBox(
-        width: double.infinity,
-        height: 48,
-        child: OutlinedButton(
-          onPressed: () => _complete(_responseController.text),
-          child: const Text('Привязать'),
-        ),
-      ),
-      if (_error != null) ...[
         const SizedBox(height: 12),
-        Text(_error!, style: const TextStyle(color: Colors.redAccent), textAlign: TextAlign.center),
-      ],
-    ]);
+        OutlinedButton(onPressed: () => _complete(_responseController.text), child: Text(s.link)),
+        AnimatedSize(
+          duration: kFast,
+          child: _error == null
+              ? const SizedBox(width: double.infinity)
+              : Padding(
+                  padding: const EdgeInsets.only(top: 12),
+                  child: Text(_error!, style: const TextStyle(color: AppColors.danger), textAlign: TextAlign.center),
+                ),
+        ),
+      ]),
+    );
   }
 }

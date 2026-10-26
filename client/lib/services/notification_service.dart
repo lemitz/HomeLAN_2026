@@ -1,6 +1,7 @@
 import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import '../l10n/strings.dart';
 
 class NotificationService {
   static final NotificationService _instance = NotificationService._internal();
@@ -14,8 +15,11 @@ class NotificationService {
   // Callback когда юзер нажал на уведомление
   Function(int? userId)? onNotificationTap;
 
+  /// Локальные уведомления есть только на мобильных платформах.
+  bool get _supported => Platform.isAndroid || Platform.isIOS;
+
   Future<void> init() async {
-    if (_isInitialized) return;
+    if (_isInitialized || !_supported) return;
 
     // Android настройки
     const androidSettings = AndroidInitializationSettings('@mipmap/ic_launcher');
@@ -59,10 +63,10 @@ class NotificationService {
   }
 
   Future<void> _createNotificationChannel() async {
-    const channel = AndroidNotificationChannel(
+    final channel = AndroidNotificationChannel(
       'homelan_messages',
-      'Сообщения',
-      description: 'Уведомления о новых сообщениях',
+      S.current.notifChannel,
+      description: S.current.notifChannelDesc,
       importance: Importance.high,
       playSound: true,
       enableVibration: true,
@@ -96,21 +100,22 @@ class NotificationService {
     bool isImage = false,
     bool isFile = false,
   }) async {
+    if (!_supported) return;
     if (!_isInitialized) await init();
 
     String body = messageText;
     if (isImage) {
-      body = '📷 Фото';
+      body = S.current.photo;
     } else if (isFile) {
-      body = '📎 Файл';
+      body = S.current.fileNotification;
     } else if (messageText.length > 100) {
       body = '${messageText.substring(0, 100)}...';
     }
 
     final androidDetails = AndroidNotificationDetails(
       'homelan_messages',
-      'Сообщения',
-      channelDescription: 'Уведомления о новых сообщениях',
+      S.current.notifChannel,
+      channelDescription: S.current.notifChannelDesc,
       importance: Importance.high,
       priority: Priority.high,
       showWhen: true,
@@ -154,11 +159,13 @@ class NotificationService {
 
   /// Убрать уведомления от конкретного юзера (когда открыли чат)
   Future<void> cancelNotificationsFromUser(int userId) async {
+    if (!_isInitialized) return;
     await _notifications.cancel(userId);
   }
 
   /// Убрать все уведомления
   Future<void> cancelAll() async {
+    if (!_isInitialized) return;
     await _notifications.cancelAll();
   }
 }
