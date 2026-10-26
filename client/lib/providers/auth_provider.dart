@@ -175,10 +175,16 @@ class AuthProvider with ChangeNotifier {
       });
 
   /// Заменяет все секреты устройства новым identity-ключом.
+  /// Ключ сохраняется первым: аккаунт на сервере уже создан, и потеря ключа
+  /// из-за ошибки локальной БД сделала бы его непригодным.
   Future<void> _replaceIdentity(Uint8List priv, Uint8List pub) async {
     await _crypto.wipeAll();
-    await _db.clearAll();
     await _crypto.importIdentity(priv, expectedPublic: pub);
+    try {
+      await _db.clearAll();
+    } catch (e) {
+      debugPrint('clear local cache failed: $e');
+    }
   }
 
   Future<void> _applySession(Map<String, dynamic> data, {required bool saveToken}) async {
