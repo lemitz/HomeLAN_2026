@@ -1,7 +1,10 @@
-; Инсталлятор Windows-клиента HomeLAN (Inno Setup 6).
+﻿; Инсталлятор Windows-клиента HomeLAN (Inno Setup 6).
 ; Перед сборкой: cd client && flutter build windows --release
 #define MyAppName "HomeLAN"
-#define MyAppVersion "1.0.0"
+; Версию передаёт CI: iscc /DMyAppVersion=1.2.3
+#ifndef MyAppVersion
+  #define MyAppVersion "1.0.0"
+#endif
 #define MyAppPublisher "LTZ xWorks"
 #define MyAppExeName "homelan_client.exe"
 #define BuildDir SourcePath + "client\build\windows\x64\runner\Release"

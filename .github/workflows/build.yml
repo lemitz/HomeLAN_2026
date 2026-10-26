@@ -1,0 +1,308 @@
+name: Build and release
+
+# - every pull request: tests, then the server for Linux/Windows, the Android APK and the Windows
+#   app, attached to the run as artifacts (Actions -> the run -> Artifacts) so a change can be
+#   tested before it is merged
+# - merge to main: the same, then a GitHub Release v<VERSION> with all binaries and SHA256SUMS.txt,
+#   but only if that tag does not exist yet - bump VERSION (and the versions it is checked against,
+#   see scripts/check-release.ps1) and RELEASE_NOTES.md in the pull request to ship a release,
+#   leave them alone and the merge only builds
+# - "Run workflow" button: build any branch on demand (never publishes)
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  # A release run must never be cancelled half way; superseded pull request runs may be.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  GO_VERSION: '1.25.x'
+  FLUTTER_VERSION: '3.38.4'
+
+jobs:
+  meta:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      publish: ${{ steps.meta.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check release metadata and decide whether to publish
+        id: meta
+        shell: pwsh
+        run: |
+          ./scripts/check-release.ps1
+          $version = (Get-Content VERSION -Raw).Trim()
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+          $publish = 'false'
+          if ($env:GITHUB_EVENT_NAME -eq 'push' -and $env:GITHUB_REF -eq 'refs/heads/main') {
+            git fetch --tags --quiet
+            if (git tag --list "v$version") {
+              Write-Host "::notice title=No release::v$version is already released. Bump VERSION and RELEASE_NOTES.md to publish a new one."
+            } else {
+              $publish = 'true'
+            }
+          }
+          "publish=$publish" >> $env:GITHUB_OUTPUT
+          Write-Host "version=$version publish=$publish"
+
+      - name: Tell the author whether merging will release
+        if: github.event_name == 'pull_request'
+        run: |
+          if git diff --quiet "origin/${{ github.base_ref }}...HEAD" -- VERSION; then
+            echo "::notice title=No release::This pull request does not change VERSION, so merging it will build but not publish a release."
+          else
+            echo "::notice title=Release::VERSION changes to $(cat VERSION): merging this pull request will publish v$(cat VERSION)."
+          fi
+
+  server:
+    needs: meta
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Ubuntu 22.04 (glibc 2.35) so the binary also runs on Debian 12 / Armbian Bookworm.
+          - { os: ubuntu-22.04, goos: linux, goarch: amd64, ext: '', archive: tar.gz }
+          - { os: ubuntu-22.04-arm, goos: linux, goarch: arm64, ext: '', archive: tar.gz }
+          - { os: windows-latest, goos: windows, goarch: amd64, ext: .exe, archive: zip }
+    name: server (${{ matrix.goos }}-${{ matrix.goarch }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+        working-directory: homelan-server
+    env:
+      CGO_ENABLED: '1' # SQLCipher is C code
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: homelan-server/go.sum
+
+      - name: Check formatting
+        if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then echo "::error::gofmt: run 'gofmt -w' on: $unformatted"; exit 1; fi
+
+      - run: go vet ./...
+
+      - name: Tests
+        run: |
+          if [ "${{ matrix.goos }}-${{ matrix.goarch }}" = "linux-amd64" ]; then
+            go test -race -count=1 ./...
+          else
+            go test -count=1 ./...
+          fi
+
+      - name: Build
+        run: |
+          version='${{ needs.meta.outputs.version }}'
+          go build -trimpath -ldflags "-s -w -X main.Version=$version" -o "build/homelan-server${{ matrix.ext }}" ./cmd/server
+
+      - name: Smoke-test the executable
+        run: |
+          out=$("./build/homelan-server${{ matrix.ext }}" --version)
+          echo "$out"
+          [ "$out" = "homelan-server ${{ needs.meta.outputs.version }}" ] || { echo "::error::Unexpected version output: '$out'"; exit 1; }
+
+      - name: Package
+        run: |
+          version='${{ needs.meta.outputs.version }}'
+          name="homelan-server-$version-${{ matrix.goos }}-${{ matrix.goarch }}"
+          mkdir -p "pkg/$name" ../dist
+          cp "build/homelan-server${{ matrix.ext }}" config.yaml "pkg/$name/"
+          cp ../LICENSE ../THIRD-PARTY-NOTICES.md ../docs/DEPLOYMENT.md ../docs/THREAT_MODEL.md "pkg/$name/"
+          cd pkg
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            7z a -tzip "../../dist/$name.zip" "$name" > /dev/null
+          else
+            tar -czf "../../dist/$name.tar.gz" "$name"
+          fi
+          ls -l ../../dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: server-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+
+  android:
+    needs: meta
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    defaults:
+      run:
+        working-directory: client
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+
+      # The runner image already ships the Android SDK; only the licences need accepting so that
+      # Gradle can download the platform, build tools and NDK the project asks for.
+      - name: Accept Android SDK licences
+        run: |
+          sdkmanager=$(ls -d "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager | head -n 1)
+          yes | "$sdkmanager" --licenses > /dev/null || true
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - run: flutter pub get
+      - run: flutter analyze
+      - run: flutter test
+
+      - name: Prepare release signing
+        env:
+          KEYSTORE_BASE64: ${{ secrets.HOMELAN_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.HOMELAN_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.HOMELAN_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.HOMELAN_KEY_PASSWORD }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/homelan-release.jks"
+            {
+              echo "HOMELAN_KEYSTORE_FILE=$RUNNER_TEMP/homelan-release.jks"
+              echo "HOMELAN_KEYSTORE_PASSWORD=$KEYSTORE_PASSWORD"
+              echo "HOMELAN_KEY_ALIAS=$KEY_ALIAS"
+              echo "HOMELAN_KEY_PASSWORD=$KEY_PASSWORD"
+            } >> "$GITHUB_ENV"
+            echo "Signing with the release keystore."
+          else
+            echo "::notice title=Android signing::No HOMELAN_KEYSTORE_BASE64 secret (pull requests from forks never get it): the APK is signed with a throw-away debug key, so installing it over an app signed differently needs an uninstall first. See scripts/make-keystore.ps1."
+          fi
+
+      # versionCode grows with every run, so each build installs over the previous one.
+      - name: Build the APK
+        run: |
+          flutter build apk --release \
+            --build-name='${{ needs.meta.outputs.version }}' \
+            --build-number=$((1000 + ${{ github.run_number }}))
+
+      - name: Show the signing certificate
+        run: |
+          apksigner=$(ls -d "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -n 1)
+          "$apksigner" verify --print-certs build/app/outputs/flutter-apk/app-release.apk \
+            | grep -E "SHA-256 digest|Signer #1 certificate DN"
+
+      - name: Collect the APK
+        run: |
+          mkdir -p ../dist
+          cp build/app/outputs/flutter-apk/app-release.apk "../dist/HomeLAN-${{ needs.meta.outputs.version }}-android.apk"
+          ls -l ../dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+
+  windows:
+    needs: meta
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Build the Windows app
+        working-directory: client
+        run: |
+          flutter pub get
+          flutter build windows --release --build-name=${{ needs.meta.outputs.version }} --build-number=${{ github.run_number }}
+
+      - name: Portable zip
+        shell: pwsh
+        run: |
+          $version = '${{ needs.meta.outputs.version }}'
+          $name = "HomeLAN-$version-windows-x64"
+          New-Item -ItemType Directory -Force dist, "pkg/$name" | Out-Null
+          Copy-Item client/build/windows/x64/runner/Release/* "pkg/$name" -Recurse
+          Copy-Item LICENSE, THIRD-PARTY-NOTICES.md "pkg/$name"
+          Compress-Archive -Path "pkg/$name" -DestinationPath "dist/$name.zip"
+
+      - name: Installer (Inno Setup)
+        shell: pwsh
+        run: |
+          $version = '${{ needs.meta.outputs.version }}'
+          # Bundled so the app also starts on a clean Windows without the Visual C++ runtime.
+          Invoke-WebRequest https://aka.ms/vs/17/release/vc_redist.x64.exe -OutFile vc_redist.x64.exe
+          $iscc = Get-ChildItem "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe", "$env:ProgramFiles\Inno Setup 6\ISCC.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $iscc) {
+            choco install innosetup --no-progress -y | Out-Null
+            $iscc = Get-ChildItem "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" | Select-Object -First 1
+          }
+          & $iscc.FullName "/DMyAppVersion=$version" "/Odist" "/FHomeLAN-$version-windows-x64-setup" homelan_setup.iss
+          if ($LASTEXITCODE -ne 0) { throw 'ISCC failed' }
+          Get-ChildItem dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    if: needs.meta.outputs.publish == 'true'
+    needs: [meta, server, android, windows]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: release
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: release
+        run: |
+          sha256sum HomeLAN-* homelan-server-* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Publish the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          gh release create "v$VERSION" release/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "HomeLAN v$VERSION" \
+            --notes-file RELEASE_NOTES.md \
+            --generate-notes

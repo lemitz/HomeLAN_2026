@@ -28,7 +28,13 @@ func main() {
 	force := flag.Bool("force", false, "перезаписать существующий ключ (данные БД станут недоступны!)")
 	configPath := flag.String("config", "config.yaml", "путь к конфигу")
 	keyFile := flag.String("key-file", "", "ТОЛЬКО ДЛЯ РАЗРАБОТКИ: путь к homelan.key вместо поиска на USB")
+	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println("homelan-server", Version)
+		return
+	}
 
 	log.Printf("HomeLAN Messenger Server %s", Version)
 

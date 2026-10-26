@@ -4,18 +4,22 @@ plugins {
     id "dev.flutter.flutter-gradle-plugin"
 }
 
-// Ключ подписи релиза: android/key.properties (не коммитится), пример:
-//   storeFile=../homelan-release.jks
-//   storePassword=...
-//   keyAlias=homelan
-//   keyPassword=...
-// Без него релиз подписывается debug-ключом (только для домашнего теста).
+// Ключ подписи релиза. Источники (по порядку):
+//  1. переменные окружения (CI): HOMELAN_KEYSTORE_FILE, HOMELAN_KEYSTORE_PASSWORD,
+//     HOMELAN_KEY_ALIAS, HOMELAN_KEY_PASSWORD — см. scripts/make-keystore.ps1;
+//  2. android/key.properties (не коммитится): storeFile, storePassword, keyAlias, keyPassword.
+// Без ключа релиз подписывается debug-ключом (только для домашнего теста).
 def keystoreProperties = new Properties()
 def keystorePropertiesFile = rootProject.file("key.properties")
-if (keystorePropertiesFile.exists()) {
+if (System.getenv("HOMELAN_KEYSTORE_FILE")) {
+    keystoreProperties['storeFile'] = System.getenv("HOMELAN_KEYSTORE_FILE")
+    keystoreProperties['storePassword'] = System.getenv("HOMELAN_KEYSTORE_PASSWORD")
+    keystoreProperties['keyAlias'] = System.getenv("HOMELAN_KEY_ALIAS")
+    keystoreProperties['keyPassword'] = System.getenv("HOMELAN_KEY_PASSWORD")
+} else if (keystorePropertiesFile.exists()) {
     keystorePropertiesFile.withInputStream { keystoreProperties.load(it) }
 }
-
+def hasReleaseKey = keystoreProperties['storeFile'] != null
 android {
     namespace "com.homelan.homelan_client"
     compileSdk 36
@@ -45,7 +49,7 @@ android {
     }
 
     signingConfigs {
-        if (keystorePropertiesFile.exists()) {
+        if (hasReleaseKey) {
             release {
                 storeFile file(keystoreProperties['storeFile'])
                 storePassword keystoreProperties['storePassword']
@@ -57,7 +61,7 @@ android {
 
     buildTypes {
         release {
-            signingConfig keystorePropertiesFile.exists() ? signingConfigs.release : signingConfigs.debug
+            signingConfig hasReleaseKey ? signingConfigs.release : signingConfigs.debug
             minifyEnabled false
             shrinkResources false
         }
