@@ -39,7 +39,7 @@ dependencies:
   # Файлы и медиа
   file_picker: ^8.0.0
   image_picker: ^1.1.0
-  mime: ^1.0.5
+  mime: ^2.1.0
   
   # Уведомления
   flutter_local_notifications: ^17.0.0
